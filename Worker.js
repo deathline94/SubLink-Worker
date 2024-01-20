@@ -5,7 +5,7 @@ addEventListener("fetch", (event) => {
 async function handleRequest(request) {
   // Define the text you want to return . One link per line.
   const text = `
-  
+  // Put the links here . One link per line...
 `;
 
   // Return the text as a response
