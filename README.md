@@ -52,28 +52,6 @@ Follow these steps to set up **SubLink-Worker**:
 - **Login**:
   - Enter your password to access the admin dashboard.
 
-### 7. Manage Your Proxy Links
-
-#### Add Links
-
-- Enter your proxy link in the **Add Link** section.
-- Click **Add Link**.
-
-#### Edit Links
-
-- Click the **edit icon** next to a link.
-- Modify the link in the input field.
-- Click the **save icon** to save changes.
-
-#### Delete Links
-
-- **Delete Selected**:
-  - Check the boxes next to the links to delete.
-  - Click **Delete Selected**.
-- **Delete All**:
-  - Click **Delete All** to remove all links.
-  - **Warning**: This action cannot be undone.
-
 ### 8. Share the Subscription URL
 
 - Provide users with your Worker URL (e.g., `https://your-worker-url/`).
