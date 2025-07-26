@@ -12,8 +12,11 @@ async function handleRequest(request) {
     return handleAdmin(request);
   } else if (path === "/update-links") {
     return updateLinks(request);
+  } else if (path === "/" || path === "") {
+    // Main domain serves the subscription content directly
+    return generateSubscription(request);
   } else {
-    return displayLinks();
+    return generateSubscription(request);
   }
 }
 
@@ -68,20 +71,38 @@ async function handleAdmin(request) {
 
 function generateSetPasswordPage() {
   return `
-    <html>
+    <!DOCTYPE html>
+    <html lang="en">
       <head>
-        <title>Set Admin Password</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SubLink Worker - Set Password</title>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
         <style>
-          ${commonStyles()}
+          ${modernStyles()}
         </style>
       </head>
       <body>
-        <div class="container">
-          <h2>Set Admin Password</h2>
-          <form method="POST">
-            <input type="password" name="password" placeholder="Set Password" required/>
-            <button type="submit">Set Password</button>
-          </form>
+        <div class="auth-container">
+          <div class="auth-card">
+            <div class="auth-header">
+              <div class="logo">
+                <div class="logo-icon">🔗</div>
+                <h1>SubLink Worker</h1>
+              </div>
+              <p>Set your admin password to get started</p>
+            </div>
+            <form method="POST" class="auth-form">
+              <div class="input-group">
+                <input type="password" name="password" placeholder="Create a secure password" required/>
+                <div class="input-border"></div>
+              </div>
+              <button type="submit" class="btn-primary">
+                <span>Set Password</span>
+                <div class="btn-ripple"></div>
+              </button>
+            </form>
+          </div>
         </div>
       </body>
     </html>
@@ -90,20 +111,38 @@ function generateSetPasswordPage() {
 
 function generateLoginPage() {
   return `
-    <html>
+    <!DOCTYPE html>
+    <html lang="en">
       <head>
-        <title>Admin Login</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SubLink Worker - Login</title>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
         <style>
-          ${commonStyles()}
+          ${modernStyles()}
         </style>
       </head>
       <body>
-        <div class="container">
-          <h2>Admin Login</h2>
-          <form method="POST">
-            <input type="password" name="password" placeholder="Password" required/>
-            <button type="submit">Login</button>
-          </form>
+        <div class="auth-container">
+          <div class="auth-card">
+            <div class="auth-header">
+              <div class="logo">
+                <div class="logo-icon">🔗</div>
+                <h1>SubLink Worker</h1>
+              </div>
+              <p>Enter your password to access the admin panel</p>
+            </div>
+            <form method="POST" class="auth-form">
+              <div class="input-group">
+                <input type="password" name="password" placeholder="Enter your password" required/>
+                <div class="input-border"></div>
+              </div>
+              <button type="submit" class="btn-primary">
+                <span>Login</span>
+                <div class="btn-ripple"></div>
+              </button>
+            </form>
+          </div>
         </div>
       </body>
     </html>
@@ -112,146 +151,966 @@ function generateLoginPage() {
 
 async function generateAdminDashboard() {
   const links = (await SUB.get("vpn_links")) || "";
+  const url = new URL(request.url);
+  const subscriptionUrl = `${url.protocol}//${url.host}`;
 
   return `
-    <html>
+    <!DOCTYPE html>
+    <html lang="en">
       <head>
-        <title>Admin Dashboard</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>SubLink Worker - Dashboard</title>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
         <style>
+          ${modernStyles()}
           ${dashboardStyles()}
         </style>
       </head>
       <body>
-        <div class="admin-container">
-          <header class="header">
-            <h1>Admin Dashboard</h1>
+        <div class="dashboard-container">
+          <header class="dashboard-header">
+            <div class="logo">
+              <div class="logo-icon">🔗</div>
+              <h1>SubLink Worker</h1>
+            </div>
+            <div class="header-actions">
+              <button class="btn-secondary" onclick="showHelp()">
+                <span>📖 Help</span>
+              </button>
+              <button class="btn-secondary" onclick="logout()">
+                <span>🚪 Logout</span>
+              </button>
+            </div>
           </header>
-          <div class="main-content">
-            <form id="update-links-form" action="/update-links" method="POST" onsubmit="return saveLinks(event);">
-              <textarea id="links-box" name="links" rows="10" style="width:100%;">${links}</textarea>
-              <div class="footer-buttons">
-                <button type="button" class="clear-all-button" onclick="clearAllLinks()">Clear All</button>
-                <button id="save-button" type="submit" class="save-button">Save</button>
+
+          <main class="dashboard-main">
+            <div class="dashboard-grid">
+              <div class="card main-card">
+                <div class="card-header">
+                  <h2>🔧 Configuration Links</h2>
+                  <div class="card-actions">
+                    <button class="btn-icon" onclick="importConfig()" title="Import Config">
+                      📁
+                    </button>
+                    <button class="btn-icon" onclick="exportConfig()" title="Export Config">
+                      💾
+                    </button>
+                  </div>
+                </div>
+                <div class="card-content">
+                  <form id="update-links-form" onsubmit="return saveLinks(event);">
+                    <div class="textarea-container">
+                      <textarea 
+                        id="links-box" 
+                        name="links" 
+                        rows="15" 
+                        placeholder="Paste your VPN links here...&#10;&#10;Supported formats:&#10;• JSON configs (full Xray/Sing-box configs)&#10;• vless://...&#10;• vmess://...&#10;• ss://...&#10;• trojan://...&#10;• hysteria2://...&#10;• wireguard://..."
+                      >${links}</textarea>
+                      <div class="textarea-overlay">
+                        <div class="link-counter">
+                          <span id="link-count">0</span> configs detected
+                        </div>
+                      </div>
+                    </div>
+                    <div class="form-actions">
+                      <button type="button" class="btn-danger" onclick="clearAllLinks()">
+                        <span>🗑️ Clear All</span>
+                      </button>
+                      <button type="button" class="btn-secondary" onclick="validateLinks()">
+                        <span>✅ Validate</span>
+                      </button>
+                      <button id="save-button" type="submit" class="btn-primary">
+                        <span>💾 Save Links</span>
+                        <div class="btn-ripple"></div>
+                      </button>
+                    </div>
+                  </form>
+                </div>
               </div>
-            </form>
+
+              <div class="card info-card">
+                <div class="card-header">
+                  <h2>📊 Status & Info</h2>
+                </div>
+                <div class="card-content">
+                  <div class="status-grid">
+                    <div class="status-item">
+                      <div class="status-icon">🔗</div>
+                      <div class="status-text">
+                        <span class="status-label">Subscription URL</span>
+                        <div class="url-container">
+                          <input type="text" id="sub-url" value="${subscriptionUrl}" readonly>
+                          <button class="btn-copy" onclick="copyToClipboard('sub-url')">📋</button>
+                        </div>
+                      </div>
+                    </div>
+                    <div class="status-item">
+                      <div class="status-icon">📱</div>
+                      <div class="status-text">
+                        <span class="status-label">Compatible Clients</span>
+                        <span class="status-value">v2rayNG, v2rayN, Clash</span>
+                      </div>
+                    </div>
+                    <div class="status-item">
+                      <div class="status-icon">🔒</div>
+                      <div class="status-text">
+                        <span class="status-label">Encoding</span>
+                        <span class="status-value">Base64 Subscription</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </main>
+        </div>
+
+        <!-- Help Modal -->
+        <div id="help-modal" class="modal">
+          <div class="modal-content">
+            <div class="modal-header">
+              <h2>📖 Help & Documentation</h2>
+              <button class="modal-close" onclick="closeHelp()">&times;</button>
+            </div>
+            <div class="modal-body">
+              <h3>Supported Formats:</h3>
+              <ul>
+                <li><strong>JSON configs</strong> - Full Xray/Sing-box configurations (starts with { and ends with })</li>
+                <li><strong>vless://</strong> - VLESS protocol links</li>
+                <li><strong>vmess://</strong> - VMess protocol links</li>
+                <li><strong>ss://</strong> - Shadowsocks links</li>
+                <li><strong>trojan://</strong> - Trojan protocol links</li>
+                <li><strong>hysteria2://</strong> - Hysteria2 protocol links</li>
+                <li><strong>wireguard://</strong> - WireGuard protocol links</li>
+              </ul>
+              <h3>How to use:</h3>
+              <ol>
+                <li>Paste your configs and links in the text area</li>
+                <li>JSON configs will be automatically converted to subscription links</li>
+                <li>Mix different formats as needed</li>
+                <li>Click "Save Links" to update</li>
+                <li>Use ${subscriptionUrl} as your subscription URL</li>
+              </ol>
+            </div>
           </div>
         </div>
-        <script>
-          async function saveLinks(event) {
-            event.preventDefault();
-            const form = document.getElementById('update-links-form');
-            const formData = new FormData(form);
-            const saveButton = document.getElementById('save-button');
-            
-            // Send update request
-            const response = await fetch('/update-links', {
-              method: 'POST',
-              body: formData
-            });
-            
-            // If successful, change the save button to "Saved" briefly
-            if (response.ok) {
-              saveButton.textContent = "Saved !!!";
-              setTimeout(() => {
-                saveButton.textContent = "Save";
-              }, 2000);
-            }
-          }
 
-          function clearAllLinks() {
-            document.getElementById('links-box').value = '';
-          }
+        <!-- Notifications -->
+        <div id="notifications"></div>
+
+        <script>
+          ${dashboardScript()}
         </script>
       </body>
     </html>
   `;
 }
 
-function commonStyles() {
+function modernStyles() {
   return `
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
     body {
-      font-family: 'Poppins', sans-serif;
-      background-color: #0f0f0f;
-      color: #fff;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: linear-gradient(135deg, #0c0c0c 0%, #1a1a1a 100%);
+      color: #ffffff;
+      min-height: 100vh;
+      overflow-x: hidden;
     }
-    .container {
-      background-color: #1a1a1a;
+
+    .auth-container {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .auth-card {
+      background: rgba(255, 255, 255, 0.05);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 24px;
       padding: 40px;
-      margin: 60px auto;
-      border-radius: 8px;
-      width: 400px;
-      text-align: center;
-    }
-    input[type='password'], textarea {
-      padding: 12px;
       width: 100%;
+      max-width: 400px;
+      box-shadow: 0 25px 50px rgba(0, 0, 0, 0.2);
+      transform: translateY(0);
+      transition: all 0.3s ease;
+    }
+
+    .auth-card:hover {
+      transform: translateY(-5px);
+      box-shadow: 0 35px 60px rgba(0, 0, 0, 0.3);
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      margin-bottom: 20px;
+    }
+
+    .logo-icon {
+      font-size: 48px;
+      margin-bottom: 16px;
+      animation: float 3s ease-in-out infinite;
+    }
+
+    @keyframes float {
+      0%, 100% { transform: translateY(0px); }
+      50% { transform: translateY(-10px); }
+    }
+
+    .logo h1 {
+      font-size: 28px;
+      font-weight: 700;
+      background: linear-gradient(135deg, #00ffcc, #0066ff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .auth-header p {
+      text-align: center;
+      color: rgba(255, 255, 255, 0.7);
       margin-bottom: 30px;
-      border-radius: 4px;
+      font-size: 14px;
+    }
+
+    .input-group {
+      position: relative;
+      margin-bottom: 24px;
+    }
+
+    .input-group input {
+      width: 100%;
+      padding: 16px 20px;
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      color: #ffffff;
+      font-size: 16px;
+      transition: all 0.3s ease;
+    }
+
+    .input-group input:focus {
+      outline: none;
+      border-color: #00ffcc;
+      background: rgba(255, 255, 255, 0.08);
+      box-shadow: 0 0 0 3px rgba(0, 255, 204, 0.1);
+    }
+
+    .input-border {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      background: linear-gradient(135deg, #00ffcc, #0066ff);
+      transform: scaleX(0);
+      transition: transform 0.3s ease;
+    }
+
+    .input-group input:focus + .input-border {
+      transform: scaleX(1);
+    }
+
+    .btn-primary {
+      width: 100%;
+      padding: 16px 24px;
+      background: linear-gradient(135deg, #00ffcc, #0066ff);
       border: none;
+      border-radius: 12px;
+      color: #ffffff;
       font-size: 16px;
-      background-color: #2a2a2a;
-      color: #fff;
-    }
-    button {
-      background: linear-gradient(45deg, #00ffcc, #0066ff);
-      color: white;
-      padding: 12px 24px;
-      font-size: 16px;
-      border-radius: 50px;
+      font-weight: 600;
       cursor: pointer;
+      position: relative;
+      overflow: hidden;
+      transition: all 0.3s ease;
     }
-    button:hover {
-      transform: scale(1.05);
+
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 10px 25px rgba(0, 255, 204, 0.3);
+    }
+
+    .btn-primary:active {
+      transform: translateY(0);
+    }
+
+    .btn-ripple {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 0;
+      height: 0;
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      transition: all 0.6s ease;
+    }
+
+    .btn-primary:active .btn-ripple {
+      width: 300px;
+      height: 300px;
     }
   `;
 }
 
 function dashboardStyles() {
   return `
-    ${commonStyles()}
-    .admin-container {
+    .dashboard-container {
+      min-height: 100vh;
       display: flex;
       flex-direction: column;
-      min-height: 100vh;
-      width: 80%;
-      max-width: 800px;
+    }
+
+    .dashboard-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 20px 30px;
+      background: rgba(255, 255, 255, 0.02);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+
+    .header-actions {
+      display: flex;
+      gap: 12px;
+    }
+
+    .dashboard-main {
+      flex: 1;
+      padding: 30px;
+    }
+
+    .dashboard-grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 30px;
+      max-width: 1400px;
       margin: 0 auto;
     }
-    .header {
-      background: linear-gradient(45deg, #ff0066, #ffcc00);
-      color: white;
-      padding: 10px;
-      text-align: center;
-      border-radius: 25px;
+
+    .card {
+      background: rgba(255, 255, 255, 0.05);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 20px;
+      overflow: hidden;
+      transition: all 0.3s ease;
+    }
+
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+    }
+
+    .card-header {
+      padding: 24px 24px 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .card-header h2 {
+      font-size: 20px;
+      font-weight: 600;
+      color: #ffffff;
+    }
+
+    .card-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .card-content {
+      padding: 24px;
+    }
+
+    .textarea-container {
+      position: relative;
+      margin-bottom: 20px;
+    }
+
+    textarea {
       width: 100%;
-      display: inline-block;
-      box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-      font-size: 24px;
-    }
-    .header h1 {
-      margin: 0;
-      color: #fff; 
-    }
-    .main-content {
+      min-height: 350px;
       padding: 20px;
-      background-color: #0f0f0f;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 12px;
+      color: #ffffff;
+      font-family: 'Fira Code', monospace;
+      font-size: 14px;
+      line-height: 1.5;
+      resize: vertical;
+      transition: all 0.3s ease;
+    }
+
+    textarea:focus {
+      outline: none;
+      border-color: #00ffcc;
+      box-shadow: 0 0 0 3px rgba(0, 255, 204, 0.1);
+    }
+
+    .textarea-overlay {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(0, 0, 0, 0.7);
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.7);
+    }
+
+    .form-actions {
+      display: flex;
+      gap: 12px;
+      justify-content: flex-end;
+    }
+
+    .btn-secondary {
+      padding: 12px 20px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 10px;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255, 255, 255, 0.15);
+      transform: translateY(-1px);
+    }
+
+    .btn-danger {
+      padding: 12px 20px;
+      background: linear-gradient(135deg, #ff416c, #ff4b2b);
+      border: none;
+      border-radius: 10px;
+      color: #ffffff;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+
+    .btn-danger:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 8px 20px rgba(255, 65, 108, 0.3);
+    }
+
+    .btn-icon {
+      width: 40px;
+      height: 40px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 10px;
+      color: #ffffff;
+      font-size: 16px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .btn-icon:hover {
+      background: rgba(255, 255, 255, 0.15);
+      transform: scale(1.05);
+    }
+
+    .info-card {
+      height: fit-content;
+    }
+
+    .status-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .status-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 16px;
+      padding: 16px;
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .status-icon {
+      font-size: 24px;
+      width: 40px;
+      height: 40px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(0, 255, 204, 0.1);
+      border-radius: 10px;
+    }
+
+    .status-text {
       flex: 1;
     }
-    .footer-buttons {
+
+    .status-label {
+      display: block;
+      font-size: 12px;
+      color: rgba(255, 255, 255, 0.6);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .status-value {
+      font-size: 14px;
+      color: #ffffff;
+      font-weight: 500;
+    }
+
+    .url-container {
       display: flex;
-      justify-content: flex-end;
-      gap: 10px;
+      gap: 8px;
+      margin-top: 8px;
     }
-    .clear-all-button, .save-button {
-      background: linear-gradient(45deg, #ff0066, #ffcc00);
-      padding: 10px 20px;
-      font-size: 16px;
-      border-radius: 50px;
-      border: none;
+
+    .url-container input {
+      flex: 1;
+      padding: 8px 12px;
+      background: rgba(0, 0, 0, 0.3);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 8px;
+      color: #ffffff;
+      font-size: 12px;
+      font-family: monospace;
+    }
+
+    .btn-copy {
+      padding: 8px 12px;
+      background: rgba(0, 255, 204, 0.1);
+      border: 1px solid rgba(0, 255, 204, 0.3);
+      border-radius: 8px;
+      color: #00ffcc;
       cursor: pointer;
-      display: inline-flex;
-      align-items: center;
+      transition: all 0.3s ease;
     }
+
+    .btn-copy:hover {
+      background: rgba(0, 255, 204, 0.2);
+    }
+
+    .modal {
+      display: none;
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(0, 0, 0, 0.8);
+      backdrop-filter: blur(10px);
+      z-index: 1000;
+      padding: 20px;
+    }
+
+    .modal-content {
+      background: rgba(255, 255, 255, 0.05);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 20px;
+      max-width: 600px;
+      margin: 50px auto;
+      max-height: 80vh;
+      overflow-y: auto;
+    }
+
+    .modal-header {
+      padding: 24px 24px 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .modal-close {
+      background: none;
+      border: none;
+      color: #ffffff;
+      font-size: 24px;
+      cursor: pointer;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.3s ease;
+    }
+
+    .modal-close:hover {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .modal-body {
+      padding: 24px;
+    }
+
+    .modal-body h3 {
+      color: #00ffcc;
+      margin-bottom: 12px;
+      font-size: 16px;
+    }
+
+    .modal-body ul, .modal-body ol {
+      margin-bottom: 20px;
+      padding-left: 20px;
+    }
+
+    .modal-body li {
+      margin-bottom: 8px;
+      color: rgba(255, 255, 255, 0.8);
+    }
+
+    #notifications {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 1100;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .notification {
+      background: rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 12px;
+      padding: 16px 20px;
+      color: #ffffff;
+      font-size: 14px;
+      min-width: 300px;
+      animation: slideIn 0.3s ease;
+      cursor: pointer;
+    }
+
+    .notification.success {
+      border-color: rgba(0, 255, 204, 0.5);
+      background: rgba(0, 255, 204, 0.1);
+    }
+
+    .notification.error {
+      border-color: rgba(255, 65, 108, 0.5);
+      background: rgba(255, 65, 108, 0.1);
+    }
+
+    @keyframes slideIn {
+      from {
+        transform: translateX(100%);
+        opacity: 0;
+      }
+      to {
+        transform: translateX(0);
+        opacity: 1;
+      }
+    }
+
+    @media (max-width: 768px) {
+      .dashboard-grid {
+        grid-template-columns: 1fr;
+      }
+      
+      .dashboard-header {
+        padding: 16px 20px;
+        flex-direction: column;
+        gap: 16px;
+      }
+      
+      .form-actions {
+        flex-direction: column;
+      }
+      
+      .card-header {
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 12px;
+      }
+    }
+  `;
+}
+
+function dashboardScript() {
+  return `
+    // Update link counter with improved parsing
+    function updateLinkCounter() {
+      const textarea = document.getElementById('links-box');
+      const content = textarea.value.trim();
+      
+      const configs = parseConfigs(content);
+      document.getElementById('link-count').textContent = configs.length;
+    }
+
+    // Parse different config types
+    function parseConfigs(content) {
+      const configs = [];
+      let currentPos = 0;
+      
+      while (currentPos < content.length) {
+        // Skip whitespace
+        while (currentPos < content.length && /\\s/.test(content[currentPos])) {
+          currentPos++;
+        }
+        
+        if (currentPos >= content.length) break;
+        
+        // Check for JSON config (starts with {)
+        if (content[currentPos] === '{') {
+          const jsonStart = currentPos;
+          let braceCount = 0;
+          let inString = false;
+          let escaped = false;
+          
+          while (currentPos < content.length) {
+            const char = content[currentPos];
+            
+            if (!escaped && char === '"') {
+              inString = !inString;
+            } else if (!inString) {
+              if (char === '{') braceCount++;
+              else if (char === '}') braceCount--;
+            }
+            
+            escaped = !escaped && char === '\\\\';
+            currentPos++;
+            
+            if (braceCount === 0 && currentPos > jsonStart + 1) {
+              const jsonStr = content.substring(jsonStart, currentPos);
+              try {
+                JSON.parse(jsonStr);
+                configs.push({ type: 'json', content: jsonStr });
+              } catch (e) {
+                // Invalid JSON, skip
+              }
+              break;
+            }
+          }
+        }
+        // Check for protocol links
+        else {
+          const lineEnd = content.indexOf('\\n', currentPos);
+          const line = lineEnd === -1 ? 
+            content.substring(currentPos).trim() : 
+            content.substring(currentPos, lineEnd).trim();
+          
+          if (line && (
+            line.startsWith('vless://') ||
+            line.startsWith('vmess://') ||
+            line.startsWith('ss://') ||
+            line.startsWith('trojan://') ||
+            line.startsWith('hysteria2://') ||
+            line.startsWith('hy2://') ||
+            line.startsWith('hysteria://') ||
+            line.startsWith('tuic://') ||
+            line.startsWith('wireguard://')
+          )) {
+            configs.push({ type: 'link', content: line });
+          }
+          
+          currentPos = lineEnd === -1 ? content.length : lineEnd + 1;
+        }
+      }
+      
+      return configs;
+    }
+
+    // Save links function
+    async function saveLinks(event) {
+      event.preventDefault();
+      const form = document.getElementById('update-links-form');
+      const formData = new FormData(form);
+      const saveButton = document.getElementById('save-button');
+      const originalText = saveButton.innerHTML;
+      
+      saveButton.innerHTML = '<span>💫 Saving...</span>';
+      saveButton.disabled = true;
+      
+      try {
+        const response = await fetch('/update-links', {
+          method: 'POST',
+          body: formData
+        });
+        
+        if (response.ok) {
+          saveButton.innerHTML = '<span>✅ Saved!</span>';
+          showNotification('Links saved successfully!', 'success');
+          setTimeout(() => {
+            saveButton.innerHTML = originalText;
+            saveButton.disabled = false;
+          }, 2000);
+        } else {
+          throw new Error('Failed to save');
+        }
+      } catch (error) {
+        saveButton.innerHTML = '<span>❌ Error</span>';
+        showNotification('Failed to save links. Please try again.', 'error');
+        setTimeout(() => {
+          saveButton.innerHTML = originalText;
+          saveButton.disabled = false;
+        }, 2000);
+      }
+    }
+
+    // Clear all links
+    function clearAllLinks() {
+      if (confirm('Are you sure you want to clear all links?')) {
+        document.getElementById('links-box').value = '';
+        updateLinkCounter();
+        showNotification('All links cleared', 'success');
+      }
+    }
+
+    // Validate links with improved parsing
+    function validateLinks() {
+      const textarea = document.getElementById('links-box');
+      const content = textarea.value.trim();
+      const configs = parseConfigs(content);
+      
+      let validCount = 0;
+      let invalidCount = 0;
+      
+      configs.forEach(config => {
+        if (config.type === 'json') {
+          try {
+            const parsed = JSON.parse(config.content);
+            if (parsed.outbounds && Array.isArray(parsed.outbounds)) {
+              validCount++;
+            } else {
+              invalidCount++;
+            }
+          } catch (e) {
+            invalidCount++;
+          }
+        } else if (config.type === 'link') {
+          validCount++;
+        }
+      });
+      
+      // Count any remaining invalid lines
+      const lines = content.split('\\n');
+      const totalConfigs = configs.length;
+      const totalLines = lines.filter(line => line.trim()).length;
+      invalidCount += Math.max(0, totalLines - totalConfigs);
+      
+      const message = \`Validation complete: \${validCount} valid, \${invalidCount} invalid configs\`;
+      showNotification(message, invalidCount === 0 ? 'success' : 'error');
+    }
+
+    // Copy to clipboard
+    async function copyToClipboard(elementId) {
+      const element = document.getElementById(elementId);
+      try {
+        await navigator.clipboard.writeText(element.value);
+        showNotification('Copied to clipboard!', 'success');
+      } catch (err) {
+        element.select();
+        document.execCommand('copy');
+        showNotification('Copied to clipboard!', 'success');
+      }
+    }
+
+    // Show notification
+    function showNotification(message, type = 'info') {
+      const notification = document.createElement('div');
+      notification.className = \`notification \${type}\`;
+      notification.textContent = message;
+      notification.onclick = () => notification.remove();
+      
+      document.getElementById('notifications').appendChild(notification);
+      
+      setTimeout(() => {
+        notification.remove();
+      }, 5000);
+    }
+
+    // Help modal functions
+    function showHelp() {
+      document.getElementById('help-modal').style.display = 'block';
+    }
+
+    function closeHelp() {
+      document.getElementById('help-modal').style.display = 'none';
+    }
+
+    // Import/Export functions
+    function importConfig() {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.txt,.json';
+      input.onchange = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            document.getElementById('links-box').value = e.target.result;
+            updateLinkCounter();
+            showNotification('Configuration imported successfully!', 'success');
+          };
+          reader.readAsText(file);
+        }
+      };
+      input.click();
+    }
+
+    function exportConfig() {
+      const content = document.getElementById('links-box').value;
+      const blob = new Blob([content], { type: 'text/plain' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'sublink-config.txt';
+      a.click();
+      URL.revokeObjectURL(url);
+      showNotification('Configuration exported successfully!', 'success');
+    }
+
+    // Logout function
+    function logout() {
+      if (confirm('Are you sure you want to logout?')) {
+        document.cookie = 'admin-auth=; Path=/; Expires=Thu, 01 Jan 1970 00:00:01 GMT;';
+        window.location.reload();
+      }
+    }
+
+    // Initialize
+    document.addEventListener('DOMContentLoaded', function() {
+      const textarea = document.getElementById('links-box');
+      textarea.addEventListener('input', updateLinkCounter);
+      updateLinkCounter();
+      
+      // Close modal when clicking outside
+      document.getElementById('help-modal').addEventListener('click', function(e) {
+        if (e.target === this) {
+          closeHelp();
+        }
+      });
+    });
   `;
 }
 
@@ -263,11 +1122,206 @@ function getCookie(request, name) {
   return cookieMap.get(name);
 }
 
-async function displayLinks() {
-  const rawLinks = (await SUB.get("vpn_links")) || "";
-  return new Response(rawLinks, {
-    headers: { "content-type": "text/plain; charset=UTF-8" },
+async function generateSubscription(request) {
+  const rawContent = (await SUB.get("vpn_links")) || "";
+  
+  if (!rawContent.trim()) {
+    return new Response("", {
+      headers: { 
+        "content-type": "text/plain; charset=UTF-8",
+        "profile-update-interval": "24"
+      },
+    });
+  }
+
+  const processedLinks = [];
+  let currentPos = 0;
+  
+  while (currentPos < rawContent.length) {
+    // Skip whitespace
+    while (currentPos < rawContent.length && /\s/.test(rawContent[currentPos])) {
+      currentPos++;
+    }
+    
+    if (currentPos >= rawContent.length) break;
+    
+    // Check for JSON config (starts with {)
+    if (rawContent[currentPos] === '{') {
+      const jsonStart = currentPos;
+      let braceCount = 0;
+      let inString = false;
+      let escaped = false;
+      
+      while (currentPos < rawContent.length) {
+        const char = rawContent[currentPos];
+        
+        if (!escaped && char === '"') {
+          inString = !inString;
+        } else if (!inString) {
+          if (char === '{') braceCount++;
+          else if (char === '}') braceCount--;
+        }
+        
+        escaped = !escaped && char === '\\';
+        currentPos++;
+        
+        if (braceCount === 0 && currentPos > jsonStart + 1) {
+          const jsonStr = rawContent.substring(jsonStart, currentPos);
+          try {
+            const jsonConfig = JSON.parse(jsonStr);
+            const convertedLinks = convertJsonToSubscriptionLinks(jsonConfig);
+            processedLinks.push(...convertedLinks);
+          } catch (error) {
+            console.error('Invalid JSON config:', error);
+          }
+          break;
+        }
+      }
+    }
+    // Check for protocol links
+    else {
+      const lineEnd = rawContent.indexOf('\n', currentPos);
+      const line = lineEnd === -1 ? 
+        rawContent.substring(currentPos).trim() : 
+        rawContent.substring(currentPos, lineEnd).trim();
+      
+      if (line && (
+        line.startsWith('vless://') ||
+        line.startsWith('vmess://') ||
+        line.startsWith('ss://') ||
+        line.startsWith('trojan://') ||
+        line.startsWith('hysteria2://') ||
+        line.startsWith('hy2://') ||
+        line.startsWith('hysteria://') ||
+        line.startsWith('tuic://') ||
+        line.startsWith('wireguard://')
+      )) {
+        processedLinks.push(line);
+      }
+      
+      currentPos = lineEnd === -1 ? rawContent.length : lineEnd + 1;
+    }
+  }
+
+  // Encode the processed links as base64 subscription
+  const subscriptionContent = processedLinks.join('\n');
+  const base64Content = btoa(unescape(encodeURIComponent(subscriptionContent)));
+  
+  return new Response(base64Content, {
+    headers: { 
+      "content-type": "text/plain; charset=UTF-8",
+      "profile-update-interval": "24",
+      "subscription-userinfo": `upload=0; download=0; total=0; expire=0`
+    },
   });
+}
+
+function convertJsonToSubscriptionLinks(jsonConfig) {
+  const links = [];
+  
+  try {
+    if (!jsonConfig.outbounds || !Array.isArray(jsonConfig.outbounds)) {
+      return [];
+    }
+    
+    // Find proxy outbounds (exclude direct, dns, etc.)
+    const proxyOutbounds = jsonConfig.outbounds.filter(outbound => 
+      outbound.protocol && 
+      ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria', 'hysteria2'].includes(outbound.protocol) &&
+      outbound.settings
+    );
+    
+    proxyOutbounds.forEach((outbound, index) => {
+      const protocol = outbound.protocol;
+      const settings = outbound.settings;
+      const streamSettings = outbound.streamSettings || {};
+      const tag = outbound.tag || `proxy-${index + 1}`;
+      
+      if (protocol === 'vless' && settings.vnext && settings.vnext[0]) {
+        const server = settings.vnext[0];
+        const user = server.users[0];
+        
+        let vlessLink = `vless://${user.id}@${server.address}:${server.port}`;
+        
+        const params = new URLSearchParams();
+        params.append('encryption', user.encryption || 'none');
+        params.append('security', streamSettings.security || 'none');
+        params.append('type', streamSettings.network || 'tcp');
+        
+        // Handle different network types
+        if (streamSettings.network === 'ws' && streamSettings.wsSettings) {
+          const wsSettings = streamSettings.wsSettings;
+          if (wsSettings.path) params.append('path', wsSettings.path);
+          if (wsSettings.host) params.append('host', wsSettings.host);
+        } else if (streamSettings.network === 'grpc' && streamSettings.grpcSettings) {
+          const grpcSettings = streamSettings.grpcSettings;
+          if (grpcSettings.serviceName) params.append('serviceName', grpcSettings.serviceName);
+        } else if (streamSettings.network === 'tcp' && streamSettings.tcpSettings) {
+          const tcpSettings = streamSettings.tcpSettings;
+          if (tcpSettings.header && tcpSettings.header.type === 'http') {
+            params.append('headerType', 'http');
+            if (tcpSettings.header.request && tcpSettings.header.request.headers && tcpSettings.header.request.headers.Host) {
+              params.append('host', tcpSettings.header.request.headers.Host[0] || '');
+            }
+          }
+        }
+        
+        // Handle TLS settings
+        if (streamSettings.security === 'tls' && streamSettings.tlsSettings) {
+          const tlsSettings = streamSettings.tlsSettings;
+          if (tlsSettings.serverName) params.append('sni', tlsSettings.serverName);
+          if (tlsSettings.fingerprint) params.append('fp', tlsSettings.fingerprint);
+          if (tlsSettings.alpn && tlsSettings.alpn.length > 0) {
+            params.append('alpn', tlsSettings.alpn.join(','));
+          }
+          if (tlsSettings.allowInsecure) params.append('allowInsecure', '1');
+        }
+        
+        vlessLink += '?' + params.toString();
+        vlessLink += '#' + encodeURIComponent(tag);
+        
+        links.push(vlessLink);
+      }
+      
+      // Add support for other protocols (vmess, trojan, etc.) as needed
+      else if (protocol === 'trojan' && settings.servers && settings.servers[0]) {
+        const server = settings.servers[0];
+        
+        let trojanLink = `trojan://${server.password}@${server.address}:${server.port}`;
+        
+        const params = new URLSearchParams();
+        params.append('security', streamSettings.security || 'tls');
+        params.append('type', streamSettings.network || 'tcp');
+        
+        // Handle network settings similar to vless
+        if (streamSettings.network === 'ws' && streamSettings.wsSettings) {
+          const wsSettings = streamSettings.wsSettings;
+          if (wsSettings.path) params.append('path', wsSettings.path);
+          if (wsSettings.host) params.append('host', wsSettings.host);
+        }
+        
+        if (streamSettings.security === 'tls' && streamSettings.tlsSettings) {
+          const tlsSettings = streamSettings.tlsSettings;
+          if (tlsSettings.serverName) params.append('sni', tlsSettings.serverName);
+          if (tlsSettings.fingerprint) params.append('fp', tlsSettings.fingerprint);
+          if (tlsSettings.alpn && tlsSettings.alpn.length > 0) {
+            params.append('alpn', tlsSettings.alpn.join(','));
+          }
+          if (tlsSettings.allowInsecure) params.append('allowInsecure', '1');
+        }
+        
+        trojanLink += '?' + params.toString();
+        trojanLink += '#' + encodeURIComponent(tag);
+        
+        links.push(trojanLink);
+      }
+    });
+    
+  } catch (error) {
+    console.error('Error converting JSON config:', error);
+  }
+  
+  return links;
 }
 
 async function updateLinks(request) {
