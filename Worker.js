@@ -30,7 +30,7 @@ async function handleAdmin(request) {
         headers: { "content-type": "text/html; charset=UTF-8" },
       });
     } else if (cookie === "logged_in") {
-      return new Response(await generateAdminDashboard(), {
+      return new Response(await generateAdminDashboard(request), {
         headers: { "content-type": "text/html; charset=UTF-8" },
       });
     } else {
@@ -51,7 +51,7 @@ async function handleAdmin(request) {
     } else {
       const password = formData.get("password");
       if (password === storedPassword) {
-        const response = new Response(await generateAdminDashboard(), {
+        const response = new Response(await generateAdminDashboard(request), {
           headers: { "content-type": "text/html; charset=UTF-8" },
         });
         response.headers.append(
@@ -149,8 +149,9 @@ function generateLoginPage() {
   `;
 }
 
-async function generateAdminDashboard() {
+async function generateAdminDashboard(request) {
   const links = (await SUB.get("vpn_links")) || "";
+  // Fix: Make subscription URL dynamic based on current request
   const url = new URL(request.url);
   const subscriptionUrl = `${url.protocol}//${url.host}`;
 
@@ -205,7 +206,7 @@ async function generateAdminDashboard() {
                         id="links-box" 
                         name="links" 
                         rows="15" 
-                        placeholder="Paste your VPN links here...&#10;&#10;Supported formats:&#10;• JSON configs (full Xray/Sing-box configs)&#10;• vless://...&#10;• vmess://...&#10;• ss://...&#10;• trojan://...&#10;• hysteria2://...&#10;• wireguard://..."
+                        placeholder="Paste your VPN links here...&#10;&#10;Supported formats:&#10;• JSON configs (full Xray/Sing-box configs)&#10;• vless://...&#10;• vmess://...&#10;• ss://...&#10;• trojan://...&#10;• hysteria2://...&#10;• wireguard://...&#10;• Custom configs with fragments and special options"
                       >${links}</textarea>
                       <div class="textarea-overlay">
                         <div class="link-counter">
@@ -276,18 +277,19 @@ async function generateAdminDashboard() {
             <div class="modal-body">
               <h3>Supported Formats:</h3>
               <ul>
-                <li><strong>JSON configs</strong> - Full Xray/Sing-box configurations (starts with { and ends with })</li>
+                <li><strong>JSON configs</strong> - Full Xray/Sing-box configurations (preserved as-is)</li>
                 <li><strong>vless://</strong> - VLESS protocol links</li>
                 <li><strong>vmess://</strong> - VMess protocol links</li>
                 <li><strong>ss://</strong> - Shadowsocks links</li>
                 <li><strong>trojan://</strong> - Trojan protocol links</li>
                 <li><strong>hysteria2://</strong> - Hysteria2 protocol links</li>
                 <li><strong>wireguard://</strong> - WireGuard protocol links</li>
+                <li><strong>Custom configs</strong> - With fragments and special options</li>
               </ul>
               <h3>How to use:</h3>
               <ol>
                 <li>Paste your configs and links in the text area</li>
-                <li>JSON configs will be automatically converted to subscription links</li>
+                <li>Custom JSON configs will be preserved exactly as entered</li>
                 <li>Mix different formats as needed</li>
                 <li>Click "Save Links" to update</li>
                 <li>Use ${subscriptionUrl} as your subscription URL</li>
@@ -870,70 +872,34 @@ function dashboardScript() {
     // Parse different config types
     function parseConfigs(content) {
       const configs = [];
-      let currentPos = 0;
+      const lines = content.split('\\n');
       
-      while (currentPos < content.length) {
-        // Skip whitespace
-        while (currentPos < content.length && /\\s/.test(content[currentPos])) {
-          currentPos++;
-        }
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine) continue;
         
-        if (currentPos >= content.length) break;
-        
-        // Check for JSON config (starts with {)
-        if (content[currentPos] === '{') {
-          const jsonStart = currentPos;
-          let braceCount = 0;
-          let inString = false;
-          let escaped = false;
-          
-          while (currentPos < content.length) {
-            const char = content[currentPos];
-            
-            if (!escaped && char === '"') {
-              inString = !inString;
-            } else if (!inString) {
-              if (char === '{') braceCount++;
-              else if (char === '}') braceCount--;
-            }
-            
-            escaped = !escaped && char === '\\\\';
-            currentPos++;
-            
-            if (braceCount === 0 && currentPos > jsonStart + 1) {
-              const jsonStr = content.substring(jsonStart, currentPos);
-              try {
-                JSON.parse(jsonStr);
-                configs.push({ type: 'json', content: jsonStr });
-              } catch (e) {
-                // Invalid JSON, skip
-              }
-              break;
-            }
+        // Check if it's a JSON config (starts with { and appears to be JSON)
+        if (trimmedLine.startsWith('{')) {
+          try {
+            JSON.parse(trimmedLine);
+            configs.push({ type: 'json', content: trimmedLine });
+          } catch (e) {
+            // Invalid JSON, skip
           }
         }
         // Check for protocol links
-        else {
-          const lineEnd = content.indexOf('\\n', currentPos);
-          const line = lineEnd === -1 ? 
-            content.substring(currentPos).trim() : 
-            content.substring(currentPos, lineEnd).trim();
-          
-          if (line && (
-            line.startsWith('vless://') ||
-            line.startsWith('vmess://') ||
-            line.startsWith('ss://') ||
-            line.startsWith('trojan://') ||
-            line.startsWith('hysteria2://') ||
-            line.startsWith('hy2://') ||
-            line.startsWith('hysteria://') ||
-            line.startsWith('tuic://') ||
-            line.startsWith('wireguard://')
-          )) {
-            configs.push({ type: 'link', content: line });
-          }
-          
-          currentPos = lineEnd === -1 ? content.length : lineEnd + 1;
+        else if (
+          trimmedLine.startsWith('vless://') ||
+          trimmedLine.startsWith('vmess://') ||
+          trimmedLine.startsWith('ss://') ||
+          trimmedLine.startsWith('trojan://') ||
+          trimmedLine.startsWith('hysteria2://') ||
+          trimmedLine.startsWith('hy2://') ||
+          trimmedLine.startsWith('hysteria://') ||
+          trimmedLine.startsWith('tuic://') ||
+          trimmedLine.startsWith('wireguard://')
+        ) {
+          configs.push({ type: 'link', content: trimmedLine });
         }
       }
       
@@ -999,7 +965,7 @@ function dashboardScript() {
         if (config.type === 'json') {
           try {
             const parsed = JSON.parse(config.content);
-            if (parsed.outbounds && Array.isArray(parsed.outbounds)) {
+            if (parsed.outbounds || parsed.inbounds || parsed.routing) {
               validCount++;
             } else {
               invalidCount++;
@@ -1134,77 +1100,43 @@ async function generateSubscription(request) {
     });
   }
 
-  const processedLinks = [];
-  let currentPos = 0;
+  // Fix: Preserve custom configs instead of converting them
+  const processedLines = [];
+  const lines = rawContent.split('\n');
   
-  while (currentPos < rawContent.length) {
-    // Skip whitespace
-    while (currentPos < rawContent.length && /\s/.test(rawContent[currentPos])) {
-      currentPos++;
-    }
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    if (!trimmedLine) continue;
     
-    if (currentPos >= rawContent.length) break;
-    
-    // Check for JSON config (starts with {)
-    if (rawContent[currentPos] === '{') {
-      const jsonStart = currentPos;
-      let braceCount = 0;
-      let inString = false;
-      let escaped = false;
-      
-      while (currentPos < rawContent.length) {
-        const char = rawContent[currentPos];
-        
-        if (!escaped && char === '"') {
-          inString = !inString;
-        } else if (!inString) {
-          if (char === '{') braceCount++;
-          else if (char === '}') braceCount--;
-        }
-        
-        escaped = !escaped && char === '\\';
-        currentPos++;
-        
-        if (braceCount === 0 && currentPos > jsonStart + 1) {
-          const jsonStr = rawContent.substring(jsonStart, currentPos);
-          try {
-            const jsonConfig = JSON.parse(jsonStr);
-            const convertedLinks = convertJsonToSubscriptionLinks(jsonConfig);
-            processedLinks.push(...convertedLinks);
-          } catch (error) {
-            console.error('Invalid JSON config:', error);
-          }
-          break;
-        }
+    // Check if it's a JSON config (starts with { and appears to be JSON)
+    if (trimmedLine.startsWith('{')) {
+      try {
+        // Validate it's proper JSON but don't convert it - preserve as-is
+        JSON.parse(trimmedLine);
+        processedLines.push(trimmedLine); // Keep the original JSON config
+      } catch (error) {
+        // If it's not valid JSON, skip it
+        console.error('Invalid JSON config:', error);
       }
     }
     // Check for protocol links
-    else {
-      const lineEnd = rawContent.indexOf('\n', currentPos);
-      const line = lineEnd === -1 ? 
-        rawContent.substring(currentPos).trim() : 
-        rawContent.substring(currentPos, lineEnd).trim();
-      
-      if (line && (
-        line.startsWith('vless://') ||
-        line.startsWith('vmess://') ||
-        line.startsWith('ss://') ||
-        line.startsWith('trojan://') ||
-        line.startsWith('hysteria2://') ||
-        line.startsWith('hy2://') ||
-        line.startsWith('hysteria://') ||
-        line.startsWith('tuic://') ||
-        line.startsWith('wireguard://')
-      )) {
-        processedLinks.push(line);
-      }
-      
-      currentPos = lineEnd === -1 ? rawContent.length : lineEnd + 1;
+    else if (
+      trimmedLine.startsWith('vless://') ||
+      trimmedLine.startsWith('vmess://') ||
+      trimmedLine.startsWith('ss://') ||
+      trimmedLine.startsWith('trojan://') ||
+      trimmedLine.startsWith('hysteria2://') ||
+      trimmedLine.startsWith('hy2://') ||
+      trimmedLine.startsWith('hysteria://') ||
+      trimmedLine.startsWith('tuic://') ||
+      trimmedLine.startsWith('wireguard://')
+    ) {
+      processedLines.push(trimmedLine);
     }
   }
 
-  // Encode the processed links as base64 subscription
-  const subscriptionContent = processedLinks.join('\n');
+  // Encode the processed lines as base64 subscription
+  const subscriptionContent = processedLines.join('\n');
   const base64Content = btoa(unescape(encodeURIComponent(subscriptionContent)));
   
   return new Response(base64Content, {
@@ -1214,114 +1146,6 @@ async function generateSubscription(request) {
       "subscription-userinfo": `upload=0; download=0; total=0; expire=0`
     },
   });
-}
-
-function convertJsonToSubscriptionLinks(jsonConfig) {
-  const links = [];
-  
-  try {
-    if (!jsonConfig.outbounds || !Array.isArray(jsonConfig.outbounds)) {
-      return [];
-    }
-    
-    // Find proxy outbounds (exclude direct, dns, etc.)
-    const proxyOutbounds = jsonConfig.outbounds.filter(outbound => 
-      outbound.protocol && 
-      ['vless', 'vmess', 'trojan', 'shadowsocks', 'hysteria', 'hysteria2'].includes(outbound.protocol) &&
-      outbound.settings
-    );
-    
-    proxyOutbounds.forEach((outbound, index) => {
-      const protocol = outbound.protocol;
-      const settings = outbound.settings;
-      const streamSettings = outbound.streamSettings || {};
-      const tag = outbound.tag || `proxy-${index + 1}`;
-      
-      if (protocol === 'vless' && settings.vnext && settings.vnext[0]) {
-        const server = settings.vnext[0];
-        const user = server.users[0];
-        
-        let vlessLink = `vless://${user.id}@${server.address}:${server.port}`;
-        
-        const params = new URLSearchParams();
-        params.append('encryption', user.encryption || 'none');
-        params.append('security', streamSettings.security || 'none');
-        params.append('type', streamSettings.network || 'tcp');
-        
-        // Handle different network types
-        if (streamSettings.network === 'ws' && streamSettings.wsSettings) {
-          const wsSettings = streamSettings.wsSettings;
-          if (wsSettings.path) params.append('path', wsSettings.path);
-          if (wsSettings.host) params.append('host', wsSettings.host);
-        } else if (streamSettings.network === 'grpc' && streamSettings.grpcSettings) {
-          const grpcSettings = streamSettings.grpcSettings;
-          if (grpcSettings.serviceName) params.append('serviceName', grpcSettings.serviceName);
-        } else if (streamSettings.network === 'tcp' && streamSettings.tcpSettings) {
-          const tcpSettings = streamSettings.tcpSettings;
-          if (tcpSettings.header && tcpSettings.header.type === 'http') {
-            params.append('headerType', 'http');
-            if (tcpSettings.header.request && tcpSettings.header.request.headers && tcpSettings.header.request.headers.Host) {
-              params.append('host', tcpSettings.header.request.headers.Host[0] || '');
-            }
-          }
-        }
-        
-        // Handle TLS settings
-        if (streamSettings.security === 'tls' && streamSettings.tlsSettings) {
-          const tlsSettings = streamSettings.tlsSettings;
-          if (tlsSettings.serverName) params.append('sni', tlsSettings.serverName);
-          if (tlsSettings.fingerprint) params.append('fp', tlsSettings.fingerprint);
-          if (tlsSettings.alpn && tlsSettings.alpn.length > 0) {
-            params.append('alpn', tlsSettings.alpn.join(','));
-          }
-          if (tlsSettings.allowInsecure) params.append('allowInsecure', '1');
-        }
-        
-        vlessLink += '?' + params.toString();
-        vlessLink += '#' + encodeURIComponent(tag);
-        
-        links.push(vlessLink);
-      }
-      
-      // Add support for other protocols (vmess, trojan, etc.) as needed
-      else if (protocol === 'trojan' && settings.servers && settings.servers[0]) {
-        const server = settings.servers[0];
-        
-        let trojanLink = `trojan://${server.password}@${server.address}:${server.port}`;
-        
-        const params = new URLSearchParams();
-        params.append('security', streamSettings.security || 'tls');
-        params.append('type', streamSettings.network || 'tcp');
-        
-        // Handle network settings similar to vless
-        if (streamSettings.network === 'ws' && streamSettings.wsSettings) {
-          const wsSettings = streamSettings.wsSettings;
-          if (wsSettings.path) params.append('path', wsSettings.path);
-          if (wsSettings.host) params.append('host', wsSettings.host);
-        }
-        
-        if (streamSettings.security === 'tls' && streamSettings.tlsSettings) {
-          const tlsSettings = streamSettings.tlsSettings;
-          if (tlsSettings.serverName) params.append('sni', tlsSettings.serverName);
-          if (tlsSettings.fingerprint) params.append('fp', tlsSettings.fingerprint);
-          if (tlsSettings.alpn && tlsSettings.alpn.length > 0) {
-            params.append('alpn', tlsSettings.alpn.join(','));
-          }
-          if (tlsSettings.allowInsecure) params.append('allowInsecure', '1');
-        }
-        
-        trojanLink += '?' + params.toString();
-        trojanLink += '#' + encodeURIComponent(tag);
-        
-        links.push(trojanLink);
-      }
-    });
-    
-  } catch (error) {
-    console.error('Error converting JSON config:', error);
-  }
-  
-  return links;
 }
 
 async function updateLinks(request) {
