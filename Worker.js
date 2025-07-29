@@ -204,7 +204,7 @@ async function generateAdminDashboard(request) {
                         id="links-box" 
                         name="links" 
                         rows="15" 
-                        placeholder="Paste your VPN links here...&#10;&#10;Supported formats (can be mixed):&#10;• JSON configs (full Xray/Sing-box configs)&#10;• vless://...&#10;• vmess://...&#10;• ss://...&#10;• trojan://...&#10;• hysteria2://...&#10;• wireguard://...&#10;&#10;Example mixed content:&#10;{full JSON config}&#10;vless://your-vless-link&#10;vmess://your-vmess-link"
+                        placeholder="Paste your VPN links here...&#10;&#10;Supported formats:&#10;• JSON arrays: [&#123;config1&#125;, &#123;config2&#125;]&#10;• Individual JSON configs: &#123;...&#125;&#10;• Protocol links: vless://, vmess://, etc.&#10;• Mixed content supported!&#10;&#10;Output preserves exact format (including [ ] brackets)"
                       >${links}</textarea>
                       <div class="textarea-overlay">
                         <div class="link-counter">
@@ -255,7 +255,7 @@ async function generateAdminDashboard(request) {
                       <div class="status-icon">🔒</div>
                       <div class="status-text">
                         <span class="status-label">Format</span>
-                        <span class="status-value">Mixed JSON + Protocol Links</span>
+                        <span class="status-value">Exact JSON + Protocol Links</span>
                       </div>
                     </div>
                   </div>
@@ -273,32 +273,24 @@ async function generateAdminDashboard(request) {
               <button class="modal-close" onclick="closeHelp()">&times;</button>
             </div>
             <div class="modal-body">
-              <h3>Mixed Content Support:</h3>
-              <p>You can mix JSON configs and protocol links in the same text block. The parser will automatically detect and separate them correctly.</p>
+              <h3>Simple Output:</h3>
+              <p>Content is output exactly as entered. JSON arrays keep their [ ] brackets for v2rayN compatibility.</p>
               
               <h3>Supported Formats:</h3>
               <ul>
-                <li><strong>JSON configs</strong> - Full Xray/Sing-box configurations (preserved exactly as entered)</li>
-                <li><strong>vless://</strong> - VLESS protocol links</li>
-                <li><strong>vmess://</strong> - VMess protocol links</li>
-                <li><strong>ss://</strong> - Shadowsocks links</li>
-                <li><strong>trojan://</strong> - Trojan protocol links</li>
-                <li><strong>hysteria2://</strong> - Hysteria2 protocol links</li>
-                <li><strong>wireguard://</strong> - WireGuard protocol links</li>
+                <li><strong>JSON Arrays:</strong> [{"config1": ...}, {"config2": ...}]</li>
+                <li><strong>Individual JSON configs:</strong> {"outbounds": [...], ...}</li>
+                <li><strong>Protocol links:</strong> vless://, vmess://, ss://, etc.</li>
+                <li><strong>Mixed content:</strong> Any combination of the above</li>
               </ul>
               
-              <h3>Example Mixed Input:</h3>
-              <pre>{
-  "remarks": "Custom Config",
-  "outbounds": [...],
-  ...
-}
-vless://your-link@server:port...
-vmess://your-vmess-link...
-hysteria2://your-hy2-link...</pre>
-
-              <h3>Output:</h3>
-              <p>Both JSON configs and protocol links will be output in the subscription, maintaining their original format and order.</p>
+              <h3>Example Output:</h3>
+              <pre>[
+  {"remarks": "Config 1", "outbounds": [...]},
+  {"remarks": "Config 2", "outbounds": [...]}
+]
+vless://your-link...
+vmess://another-link...</pre>
             </div>
           </div>
         </div>
@@ -894,124 +886,45 @@ function dashboardScript() {
              line.startsWith('wireguard://');
     }
 
-    // Enhanced parsing function for mixed content
+    // Simple parsing function that counts content
     function parseConfigs(content) {
-      const configs = [];
-      const lines = content.split('\\n');
+      const trimmedContent = content.trim();
+      if (!trimmedContent) return [];
       
-      let currentJsonConfig = '';
-      let inJsonBlock = false;
-      let braceCount = 0;
-      let jsonStartIndex = -1;
+      let configCount = 0;
       
-      for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const trimmedLine = line.trim();
-        
-        // Skip empty lines when not in JSON block
-        if (!trimmedLine && !inJsonBlock) {
-          continue;
-        }
-        
-        // Check if this line starts a JSON config
-        if (trimmedLine.startsWith('{') && !inJsonBlock) {
-          inJsonBlock = true;
-          jsonStartIndex = i;
-          currentJsonConfig = line;
-          braceCount = (line.match(/\\{/g) || []).length - (line.match(/\\}/g) || []).length;
-          
-          // If the JSON is complete on one line
-          if (braceCount === 0) {
-            try {
-              JSON.parse(currentJsonConfig.trim());
-              configs.push({ 
-                type: 'json', 
-                content: currentJsonConfig.trim(),
-                line: jsonStartIndex 
-              });
-            } catch (e) {
-              // If it's not valid JSON, check if it's a protocol link
-              if (isProtocolLink(trimmedLine)) {
-                configs.push({ 
-                  type: 'link', 
-                  content: trimmedLine,
-                  line: i 
-                });
-              }
-            }
-            inJsonBlock = false;
-            currentJsonConfig = '';
-            jsonStartIndex = -1;
-          }
-        }
-        // If we're in a JSON block, continue building it
-        else if (inJsonBlock) {
-          currentJsonConfig += '\\n' + line;
-          braceCount += (line.match(/\\{/g) || []).length - (line.match(/\\}/g) || []).length;
-          
-          // If JSON block is complete
-          if (braceCount === 0) {
-            try {
-              JSON.parse(currentJsonConfig.trim());
-              configs.push({ 
-                type: 'json', 
-                content: currentJsonConfig.trim(),
-                line: jsonStartIndex 
-              });
-            } catch (e) {
-              console.warn('Invalid JSON config detected:', e);
-            }
-            inJsonBlock = false;
-            currentJsonConfig = '';
-            jsonStartIndex = -1;
-          }
-        }
-        // Check for protocol links
-        else if (isProtocolLink(trimmedLine)) {
-          configs.push({ 
-            type: 'link', 
-            content: trimmedLine,
-            line: i 
-          });
-        }
-      }
-      
-      // Handle incomplete JSON at end
-      if (inJsonBlock && currentJsonConfig.trim()) {
+      // Check if it's a JSON array
+      if (trimmedContent.startsWith('[')) {
         try {
-          JSON.parse(currentJsonConfig.trim());
-          configs.push({ 
-            type: 'json', 
-            content: currentJsonConfig.trim(),
-            line: jsonStartIndex 
-          });
+          const parsed = JSON.parse(trimmedContent);
+          if (Array.isArray(parsed)) {
+            configCount = parsed.length;
+          }
         } catch (e) {
-          console.warn('Incomplete JSON config at end of input:', e);
+          // If parsing fails, count as 1 config
+          configCount = 1;
         }
+      } else {
+        // Count individual lines that are configs
+        const lines = content.split('\\n');
+        lines.forEach(line => {
+          const trimmed = line.trim();
+          if (trimmed && (trimmed.startsWith('{') || isProtocolLink(trimmed))) {
+            configCount++;
+          }
+        });
       }
       
-      return configs;
+      return Array(configCount).fill({ type: 'config' });
     }
 
-    // Update link counter with enhanced mixed content support
+    // Update link counter
     function updateLinkCounter() {
       const textarea = document.getElementById('links-box');
       const content = textarea.value.trim();
       
       const configs = parseConfigs(content);
-      const jsonCount = configs.filter(c => c.type === 'json').length;
-      const linkCount = configs.filter(c => c.type === 'link').length;
-      
-      let countText = \`\${configs.length} configs detected\`;
-      if (jsonCount > 0 && linkCount > 0) {
-        countText = \`\${configs.length} configs (\${jsonCount} JSON, \${linkCount} links)\`;
-      } else if (jsonCount > 0) {
-        countText = \`\${jsonCount} JSON configs\`;
-      } else if (linkCount > 0) {
-        countText = \`\${linkCount} protocol links\`;
-      }
-      
-      document.getElementById('link-count').textContent = countText;
+      document.getElementById('link-count').textContent = configs.length;
     }
 
     // Save links function
@@ -1033,7 +946,7 @@ function dashboardScript() {
         
         if (response.ok) {
           saveButton.innerHTML = '<span>✅ Saved!</span>';
-          showNotification('Mixed configs saved successfully!', 'success');
+          showNotification('Configs saved successfully! Output preserves exact format.', 'success');
           setTimeout(() => {
             saveButton.innerHTML = originalText;
             saveButton.disabled = false;
@@ -1060,58 +973,18 @@ function dashboardScript() {
       }
     }
 
-    // Enhanced validation for mixed content
+    // Simple validation
     function validateLinks() {
       const textarea = document.getElementById('links-box');
       const content = textarea.value.trim();
+      
+      if (!content) {
+        showNotification('No content to validate', 'error');
+        return;
+      }
+      
       const configs = parseConfigs(content);
-      
-      let validJson = 0;
-      let validLinks = 0;
-      let invalidCount = 0;
-      let details = [];
-      
-      configs.forEach((config, index) => {
-        if (config.type === 'json') {
-          try {
-            const parsed = JSON.parse(config.content);
-            if (parsed.outbounds || parsed.inbounds || parsed.routing || parsed.remarks) {
-              validJson++;
-            } else {
-              invalidCount++;
-              details.push(\`JSON config \${index + 1}: Missing required fields\`);
-            }
-          } catch (e) {
-            invalidCount++;
-            details.push(\`JSON config \${index + 1}: Invalid JSON syntax\`);
-          }
-        } else if (config.type === 'link') {
-          validLinks++;
-        }
-      });
-      
-      // Check for unrecognized content
-      const lines = content.split('\\n');
-      const recognizedLines = configs.length;
-      const totalNonEmptyLines = lines.filter(line => line.trim()).length;
-      const unrecognizedLines = totalNonEmptyLines - recognizedLines;
-      
-      if (unrecognizedLines > 0) {
-        invalidCount += unrecognizedLines;
-        details.push(\`\${unrecognizedLines} unrecognized lines\`);
-      }
-      
-      let message = \`Validation: \${validJson} JSON, \${validLinks} links\`;
-      if (invalidCount > 0) {
-        message += \`, \${invalidCount} invalid\`;
-      }
-      
-      const isValid = invalidCount === 0;
-      showNotification(message, isValid ? 'success' : 'error');
-      
-      if (!isValid && details.length > 0) {
-        console.log('Validation details:', details);
-      }
+      showNotification(\`Validation: \${configs.length} configs detected\`, 'success');
     }
 
     // Copy to clipboard
@@ -1162,7 +1035,7 @@ function dashboardScript() {
           reader.onload = (e) => {
             document.getElementById('links-box').value = e.target.result;
             updateLinkCounter();
-            showNotification('Mixed configuration imported successfully!', 'success');
+            showNotification('Configuration imported successfully!', 'success');
           };
           reader.readAsText(file);
         }
@@ -1176,10 +1049,10 @@ function dashboardScript() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'sublink-mixed-config.txt';
+      a.download = 'sublink-config.txt';
       a.click();
       URL.revokeObjectURL(url);
-      showNotification('Mixed configuration exported successfully!', 'success');
+      showNotification('Configuration exported successfully!', 'success');
     }
 
     // Logout function
@@ -1227,7 +1100,7 @@ function isProtocolLink(line) {
          line.startsWith('wireguard://');
 }
 
-// Enhanced subscription generation for mixed content
+// SIMPLE FIX: Just output content exactly as entered
 async function generateSubscription(request) {
   const rawContent = (await SUB.get("vpn_links")) || "";
   
@@ -1240,81 +1113,8 @@ async function generateSubscription(request) {
     });
   }
 
-  const processedConfigs = [];
-  const lines = rawContent.split('\n');
-  
-  let currentJsonConfig = '';
-  let inJsonBlock = false;
-  let braceCount = 0;
-  
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmedLine = line.trim();
-    
-    // Skip empty lines when not in JSON block
-    if (!trimmedLine && !inJsonBlock) {
-      continue;
-    }
-    
-    // Check if this line starts a JSON config
-    if (trimmedLine.startsWith('{') && !inJsonBlock) {
-      inJsonBlock = true;
-      currentJsonConfig = line;
-      braceCount = (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
-      
-      // If the JSON is complete on one line
-      if (braceCount === 0) {
-        try {
-          JSON.parse(currentJsonConfig.trim());
-          processedConfigs.push(currentJsonConfig.trim());
-        } catch (error) {
-          console.error('Invalid JSON config:', error);
-          // If it's not valid JSON but looks like a protocol link, add it
-          if (isProtocolLink(trimmedLine)) {
-            processedConfigs.push(trimmedLine);
-          }
-        }
-        inJsonBlock = false;
-        currentJsonConfig = '';
-      }
-    }
-    // If we're in a JSON block, continue building it
-    else if (inJsonBlock) {
-      currentJsonConfig += '\n' + line;
-      braceCount += (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
-      
-      // If JSON block is complete
-      if (braceCount === 0) {
-        try {
-          JSON.parse(currentJsonConfig.trim());
-          processedConfigs.push(currentJsonConfig.trim());
-        } catch (error) {
-          console.error('Invalid JSON config:', error);
-        }
-        inJsonBlock = false;
-        currentJsonConfig = '';
-      }
-    }
-    // Check for protocol links
-    else if (isProtocolLink(trimmedLine)) {
-      processedConfigs.push(trimmedLine);
-    }
-  }
-  
-  // Handle incomplete JSON at end
-  if (inJsonBlock && currentJsonConfig.trim()) {
-    try {
-      JSON.parse(currentJsonConfig.trim());
-      processedConfigs.push(currentJsonConfig.trim());
-    } catch (error) {
-      console.error('Incomplete JSON config at end:', error);
-    }
-  }
-
-  // Return the mixed content - both JSON configs and protocol links
-  const subscriptionContent = processedConfigs.join('\n');
-  
-  return new Response(subscriptionContent, {
+  // Simple: just output the content exactly as it was entered
+  return new Response(rawContent, {
     headers: { 
       "content-type": "text/plain; charset=UTF-8",
       "profile-update-interval": "24",
@@ -1327,7 +1127,7 @@ async function updateLinks(request) {
   const formData = await request.formData();
   const newLinks = formData.get("links");
   await SUB.put("vpn_links", newLinks);
-  return new Response("Mixed configs updated successfully!", {
+  return new Response("Configs updated successfully!", {
     headers: { "content-type": "text/plain; charset=UTF-8" },
   });
 }
