@@ -13,7 +13,6 @@ async function handleRequest(request) {
   } else if (path === "/update-links") {
     return updateLinks(request);
   } else if (path === "/" || path === "") {
-    // Main domain serves the subscription content directly
     return generateSubscription(request);
   } else {
     return generateSubscription(request);
@@ -151,7 +150,6 @@ function generateLoginPage() {
 
 async function generateAdminDashboard(request) {
   const links = (await SUB.get("vpn_links")) || "";
-  // Fix: Make subscription URL dynamic based on current request
   const url = new URL(request.url);
   const subscriptionUrl = `${url.protocol}//${url.host}`;
 
@@ -206,7 +204,7 @@ async function generateAdminDashboard(request) {
                         id="links-box" 
                         name="links" 
                         rows="15" 
-                        placeholder="Paste your VPN links here...&#10;&#10;Supported formats:&#10;• JSON configs (full Xray/Sing-box configs)&#10;• vless://...&#10;• vmess://...&#10;• ss://...&#10;• trojan://...&#10;• hysteria2://...&#10;• wireguard://...&#10;• Custom configs with fragments and special options"
+                        placeholder="Paste your VPN links here...&#10;&#10;Supported formats (can be mixed):&#10;• JSON configs (full Xray/Sing-box configs)&#10;• vless://...&#10;• vmess://...&#10;• ss://...&#10;• trojan://...&#10;• hysteria2://...&#10;• wireguard://...&#10;&#10;Example mixed content:&#10;{full JSON config}&#10;vless://your-vless-link&#10;vmess://your-vmess-link"
                       >${links}</textarea>
                       <div class="textarea-overlay">
                         <div class="link-counter">
@@ -250,14 +248,14 @@ async function generateAdminDashboard(request) {
                       <div class="status-icon">📱</div>
                       <div class="status-text">
                         <span class="status-label">Compatible Clients</span>
-                        <span class="status-value">v2rayNG, v2rayN, Clash</span>
+                        <span class="status-value">v2rayNG, v2rayN, Clash, Sing-box</span>
                       </div>
                     </div>
                     <div class="status-item">
                       <div class="status-icon">🔒</div>
                       <div class="status-text">
-                        <span class="status-label">Encoding</span>
-                        <span class="status-value">Base64 Subscription</span>
+                        <span class="status-label">Format</span>
+                        <span class="status-value">Mixed JSON + Protocol Links</span>
                       </div>
                     </div>
                   </div>
@@ -275,25 +273,32 @@ async function generateAdminDashboard(request) {
               <button class="modal-close" onclick="closeHelp()">&times;</button>
             </div>
             <div class="modal-body">
+              <h3>Mixed Content Support:</h3>
+              <p>You can mix JSON configs and protocol links in the same text block. The parser will automatically detect and separate them correctly.</p>
+              
               <h3>Supported Formats:</h3>
               <ul>
-                <li><strong>JSON configs</strong> - Full Xray/Sing-box configurations (preserved as-is)</li>
+                <li><strong>JSON configs</strong> - Full Xray/Sing-box configurations (preserved exactly as entered)</li>
                 <li><strong>vless://</strong> - VLESS protocol links</li>
                 <li><strong>vmess://</strong> - VMess protocol links</li>
                 <li><strong>ss://</strong> - Shadowsocks links</li>
                 <li><strong>trojan://</strong> - Trojan protocol links</li>
                 <li><strong>hysteria2://</strong> - Hysteria2 protocol links</li>
                 <li><strong>wireguard://</strong> - WireGuard protocol links</li>
-                <li><strong>Custom configs</strong> - With fragments and special options</li>
               </ul>
-              <h3>How to use:</h3>
-              <ol>
-                <li>Paste your configs and links in the text area</li>
-                <li>Custom JSON configs will be preserved exactly as entered</li>
-                <li>Mix different formats as needed</li>
-                <li>Click "Save Links" to update</li>
-                <li>Use ${subscriptionUrl} as your subscription URL</li>
-              </ol>
+              
+              <h3>Example Mixed Input:</h3>
+              <pre>{
+  "remarks": "Custom Config",
+  "outbounds": [...],
+  ...
+}
+vless://your-link@server:port...
+vmess://your-vmess-link...
+hysteria2://your-hy2-link...</pre>
+
+              <h3>Output:</h3>
+              <p>Both JSON configs and protocol links will be output in the subscription, maintaining their original format and order.</p>
             </div>
           </div>
         </div>
@@ -780,6 +785,12 @@ function dashboardStyles() {
       font-size: 16px;
     }
 
+    .modal-body p {
+      margin-bottom: 16px;
+      color: rgba(255, 255, 255, 0.8);
+      line-height: 1.6;
+    }
+
     .modal-body ul, .modal-body ol {
       margin-bottom: 20px;
       padding-left: 20px;
@@ -788,6 +799,16 @@ function dashboardStyles() {
     .modal-body li {
       margin-bottom: 8px;
       color: rgba(255, 255, 255, 0.8);
+    }
+
+    .modal-body pre {
+      background: rgba(0, 0, 0, 0.3);
+      padding: 16px;
+      border-radius: 8px;
+      color: #00ffcc;
+      font-size: 12px;
+      overflow-x: auto;
+      margin: 12px 0;
     }
 
     #notifications {
@@ -860,50 +881,137 @@ function dashboardStyles() {
 
 function dashboardScript() {
   return `
-    // Update link counter with improved parsing
+    // Helper function for protocol link detection
+    function isProtocolLink(line) {
+      return line.startsWith('vless://') ||
+             line.startsWith('vmess://') ||
+             line.startsWith('ss://') ||
+             line.startsWith('trojan://') ||
+             line.startsWith('hysteria2://') ||
+             line.startsWith('hy2://') ||
+             line.startsWith('hysteria://') ||
+             line.startsWith('tuic://') ||
+             line.startsWith('wireguard://');
+    }
+
+    // Enhanced parsing function for mixed content
+    function parseConfigs(content) {
+      const configs = [];
+      const lines = content.split('\\n');
+      
+      let currentJsonConfig = '';
+      let inJsonBlock = false;
+      let braceCount = 0;
+      let jsonStartIndex = -1;
+      
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmedLine = line.trim();
+        
+        // Skip empty lines when not in JSON block
+        if (!trimmedLine && !inJsonBlock) {
+          continue;
+        }
+        
+        // Check if this line starts a JSON config
+        if (trimmedLine.startsWith('{') && !inJsonBlock) {
+          inJsonBlock = true;
+          jsonStartIndex = i;
+          currentJsonConfig = line;
+          braceCount = (line.match(/\\{/g) || []).length - (line.match(/\\}/g) || []).length;
+          
+          // If the JSON is complete on one line
+          if (braceCount === 0) {
+            try {
+              JSON.parse(currentJsonConfig.trim());
+              configs.push({ 
+                type: 'json', 
+                content: currentJsonConfig.trim(),
+                line: jsonStartIndex 
+              });
+            } catch (e) {
+              // If it's not valid JSON, check if it's a protocol link
+              if (isProtocolLink(trimmedLine)) {
+                configs.push({ 
+                  type: 'link', 
+                  content: trimmedLine,
+                  line: i 
+                });
+              }
+            }
+            inJsonBlock = false;
+            currentJsonConfig = '';
+            jsonStartIndex = -1;
+          }
+        }
+        // If we're in a JSON block, continue building it
+        else if (inJsonBlock) {
+          currentJsonConfig += '\\n' + line;
+          braceCount += (line.match(/\\{/g) || []).length - (line.match(/\\}/g) || []).length;
+          
+          // If JSON block is complete
+          if (braceCount === 0) {
+            try {
+              JSON.parse(currentJsonConfig.trim());
+              configs.push({ 
+                type: 'json', 
+                content: currentJsonConfig.trim(),
+                line: jsonStartIndex 
+              });
+            } catch (e) {
+              console.warn('Invalid JSON config detected:', e);
+            }
+            inJsonBlock = false;
+            currentJsonConfig = '';
+            jsonStartIndex = -1;
+          }
+        }
+        // Check for protocol links
+        else if (isProtocolLink(trimmedLine)) {
+          configs.push({ 
+            type: 'link', 
+            content: trimmedLine,
+            line: i 
+          });
+        }
+      }
+      
+      // Handle incomplete JSON at end
+      if (inJsonBlock && currentJsonConfig.trim()) {
+        try {
+          JSON.parse(currentJsonConfig.trim());
+          configs.push({ 
+            type: 'json', 
+            content: currentJsonConfig.trim(),
+            line: jsonStartIndex 
+          });
+        } catch (e) {
+          console.warn('Incomplete JSON config at end of input:', e);
+        }
+      }
+      
+      return configs;
+    }
+
+    // Update link counter with enhanced mixed content support
     function updateLinkCounter() {
       const textarea = document.getElementById('links-box');
       const content = textarea.value.trim();
       
       const configs = parseConfigs(content);
-      document.getElementById('link-count').textContent = configs.length;
-    }
-
-    // Parse different config types
-    function parseConfigs(content) {
-      const configs = [];
-      const lines = content.split('\\n');
+      const jsonCount = configs.filter(c => c.type === 'json').length;
+      const linkCount = configs.filter(c => c.type === 'link').length;
       
-      for (const line of lines) {
-        const trimmedLine = line.trim();
-        if (!trimmedLine) continue;
-        
-        // Check if it's a JSON config (starts with { and appears to be JSON)
-        if (trimmedLine.startsWith('{')) {
-          try {
-            JSON.parse(trimmedLine);
-            configs.push({ type: 'json', content: trimmedLine });
-          } catch (e) {
-            // Invalid JSON, skip
-          }
-        }
-        // Check for protocol links
-        else if (
-          trimmedLine.startsWith('vless://') ||
-          trimmedLine.startsWith('vmess://') ||
-          trimmedLine.startsWith('ss://') ||
-          trimmedLine.startsWith('trojan://') ||
-          trimmedLine.startsWith('hysteria2://') ||
-          trimmedLine.startsWith('hy2://') ||
-          trimmedLine.startsWith('hysteria://') ||
-          trimmedLine.startsWith('tuic://') ||
-          trimmedLine.startsWith('wireguard://')
-        ) {
-          configs.push({ type: 'link', content: trimmedLine });
-        }
+      let countText = \`\${configs.length} configs detected\`;
+      if (jsonCount > 0 && linkCount > 0) {
+        countText = \`\${configs.length} configs (\${jsonCount} JSON, \${linkCount} links)\`;
+      } else if (jsonCount > 0) {
+        countText = \`\${jsonCount} JSON configs\`;
+      } else if (linkCount > 0) {
+        countText = \`\${linkCount} protocol links\`;
       }
       
-      return configs;
+      document.getElementById('link-count').textContent = countText;
     }
 
     // Save links function
@@ -925,7 +1033,7 @@ function dashboardScript() {
         
         if (response.ok) {
           saveButton.innerHTML = '<span>✅ Saved!</span>';
-          showNotification('Links saved successfully!', 'success');
+          showNotification('Mixed configs saved successfully!', 'success');
           setTimeout(() => {
             saveButton.innerHTML = originalText;
             saveButton.disabled = false;
@@ -935,7 +1043,7 @@ function dashboardScript() {
         }
       } catch (error) {
         saveButton.innerHTML = '<span>❌ Error</span>';
-        showNotification('Failed to save links. Please try again.', 'error');
+        showNotification('Failed to save configs. Please try again.', 'error');
         setTimeout(() => {
           saveButton.innerHTML = originalText;
           saveButton.disabled = false;
@@ -945,47 +1053,65 @@ function dashboardScript() {
 
     // Clear all links
     function clearAllLinks() {
-      if (confirm('Are you sure you want to clear all links?')) {
+      if (confirm('Are you sure you want to clear all configs?')) {
         document.getElementById('links-box').value = '';
         updateLinkCounter();
-        showNotification('All links cleared', 'success');
+        showNotification('All configs cleared', 'success');
       }
     }
 
-    // Validate links with improved parsing
+    // Enhanced validation for mixed content
     function validateLinks() {
       const textarea = document.getElementById('links-box');
       const content = textarea.value.trim();
       const configs = parseConfigs(content);
       
-      let validCount = 0;
+      let validJson = 0;
+      let validLinks = 0;
       let invalidCount = 0;
+      let details = [];
       
-      configs.forEach(config => {
+      configs.forEach((config, index) => {
         if (config.type === 'json') {
           try {
             const parsed = JSON.parse(config.content);
-            if (parsed.outbounds || parsed.inbounds || parsed.routing) {
-              validCount++;
+            if (parsed.outbounds || parsed.inbounds || parsed.routing || parsed.remarks) {
+              validJson++;
             } else {
               invalidCount++;
+              details.push(\`JSON config \${index + 1}: Missing required fields\`);
             }
           } catch (e) {
             invalidCount++;
+            details.push(\`JSON config \${index + 1}: Invalid JSON syntax\`);
           }
         } else if (config.type === 'link') {
-          validCount++;
+          validLinks++;
         }
       });
       
-      // Count any remaining invalid lines
+      // Check for unrecognized content
       const lines = content.split('\\n');
-      const totalConfigs = configs.length;
-      const totalLines = lines.filter(line => line.trim()).length;
-      invalidCount += Math.max(0, totalLines - totalConfigs);
+      const recognizedLines = configs.length;
+      const totalNonEmptyLines = lines.filter(line => line.trim()).length;
+      const unrecognizedLines = totalNonEmptyLines - recognizedLines;
       
-      const message = \`Validation complete: \${validCount} valid, \${invalidCount} invalid configs\`;
-      showNotification(message, invalidCount === 0 ? 'success' : 'error');
+      if (unrecognizedLines > 0) {
+        invalidCount += unrecognizedLines;
+        details.push(\`\${unrecognizedLines} unrecognized lines\`);
+      }
+      
+      let message = \`Validation: \${validJson} JSON, \${validLinks} links\`;
+      if (invalidCount > 0) {
+        message += \`, \${invalidCount} invalid\`;
+      }
+      
+      const isValid = invalidCount === 0;
+      showNotification(message, isValid ? 'success' : 'error');
+      
+      if (!isValid && details.length > 0) {
+        console.log('Validation details:', details);
+      }
     }
 
     // Copy to clipboard
@@ -993,11 +1119,11 @@ function dashboardScript() {
       const element = document.getElementById(elementId);
       try {
         await navigator.clipboard.writeText(element.value);
-        showNotification('Copied to clipboard!', 'success');
+        showNotification('Subscription URL copied!', 'success');
       } catch (err) {
         element.select();
         document.execCommand('copy');
-        showNotification('Copied to clipboard!', 'success');
+        showNotification('Subscription URL copied!', 'success');
       }
     }
 
@@ -1036,7 +1162,7 @@ function dashboardScript() {
           reader.onload = (e) => {
             document.getElementById('links-box').value = e.target.result;
             updateLinkCounter();
-            showNotification('Configuration imported successfully!', 'success');
+            showNotification('Mixed configuration imported successfully!', 'success');
           };
           reader.readAsText(file);
         }
@@ -1050,10 +1176,10 @@ function dashboardScript() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'sublink-config.txt';
+      a.download = 'sublink-mixed-config.txt';
       a.click();
       URL.revokeObjectURL(url);
-      showNotification('Configuration exported successfully!', 'success');
+      showNotification('Mixed configuration exported successfully!', 'success');
     }
 
     // Logout function
@@ -1088,6 +1214,20 @@ function getCookie(request, name) {
   return cookieMap.get(name);
 }
 
+// Helper function for protocol link detection
+function isProtocolLink(line) {
+  return line.startsWith('vless://') ||
+         line.startsWith('vmess://') ||
+         line.startsWith('ss://') ||
+         line.startsWith('trojan://') ||
+         line.startsWith('hysteria2://') ||
+         line.startsWith('hy2://') ||
+         line.startsWith('hysteria://') ||
+         line.startsWith('tuic://') ||
+         line.startsWith('wireguard://');
+}
+
+// Enhanced subscription generation for mixed content
 async function generateSubscription(request) {
   const rawContent = (await SUB.get("vpn_links")) || "";
   
@@ -1100,46 +1240,81 @@ async function generateSubscription(request) {
     });
   }
 
-  // Fix: Preserve custom configs instead of converting them
-  const processedLines = [];
+  const processedConfigs = [];
   const lines = rawContent.split('\n');
   
-  for (const line of lines) {
+  let currentJsonConfig = '';
+  let inJsonBlock = false;
+  let braceCount = 0;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     const trimmedLine = line.trim();
-    if (!trimmedLine) continue;
     
-    // Check if it's a JSON config (starts with { and appears to be JSON)
-    if (trimmedLine.startsWith('{')) {
-      try {
-        // Validate it's proper JSON but don't convert it - preserve as-is
-        JSON.parse(trimmedLine);
-        processedLines.push(trimmedLine); // Keep the original JSON config
-      } catch (error) {
-        // If it's not valid JSON, skip it
-        console.error('Invalid JSON config:', error);
+    // Skip empty lines when not in JSON block
+    if (!trimmedLine && !inJsonBlock) {
+      continue;
+    }
+    
+    // Check if this line starts a JSON config
+    if (trimmedLine.startsWith('{') && !inJsonBlock) {
+      inJsonBlock = true;
+      currentJsonConfig = line;
+      braceCount = (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
+      
+      // If the JSON is complete on one line
+      if (braceCount === 0) {
+        try {
+          JSON.parse(currentJsonConfig.trim());
+          processedConfigs.push(currentJsonConfig.trim());
+        } catch (error) {
+          console.error('Invalid JSON config:', error);
+          // If it's not valid JSON but looks like a protocol link, add it
+          if (isProtocolLink(trimmedLine)) {
+            processedConfigs.push(trimmedLine);
+          }
+        }
+        inJsonBlock = false;
+        currentJsonConfig = '';
+      }
+    }
+    // If we're in a JSON block, continue building it
+    else if (inJsonBlock) {
+      currentJsonConfig += '\n' + line;
+      braceCount += (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
+      
+      // If JSON block is complete
+      if (braceCount === 0) {
+        try {
+          JSON.parse(currentJsonConfig.trim());
+          processedConfigs.push(currentJsonConfig.trim());
+        } catch (error) {
+          console.error('Invalid JSON config:', error);
+        }
+        inJsonBlock = false;
+        currentJsonConfig = '';
       }
     }
     // Check for protocol links
-    else if (
-      trimmedLine.startsWith('vless://') ||
-      trimmedLine.startsWith('vmess://') ||
-      trimmedLine.startsWith('ss://') ||
-      trimmedLine.startsWith('trojan://') ||
-      trimmedLine.startsWith('hysteria2://') ||
-      trimmedLine.startsWith('hy2://') ||
-      trimmedLine.startsWith('hysteria://') ||
-      trimmedLine.startsWith('tuic://') ||
-      trimmedLine.startsWith('wireguard://')
-    ) {
-      processedLines.push(trimmedLine);
+    else if (isProtocolLink(trimmedLine)) {
+      processedConfigs.push(trimmedLine);
+    }
+  }
+  
+  // Handle incomplete JSON at end
+  if (inJsonBlock && currentJsonConfig.trim()) {
+    try {
+      JSON.parse(currentJsonConfig.trim());
+      processedConfigs.push(currentJsonConfig.trim());
+    } catch (error) {
+      console.error('Incomplete JSON config at end:', error);
     }
   }
 
-  // Encode the processed lines as base64 subscription
-  const subscriptionContent = processedLines.join('\n');
-  const base64Content = btoa(unescape(encodeURIComponent(subscriptionContent)));
+  // Return the mixed content - both JSON configs and protocol links
+  const subscriptionContent = processedConfigs.join('\n');
   
-  return new Response(base64Content, {
+  return new Response(subscriptionContent, {
     headers: { 
       "content-type": "text/plain; charset=UTF-8",
       "profile-update-interval": "24",
@@ -1152,7 +1327,7 @@ async function updateLinks(request) {
   const formData = await request.formData();
   const newLinks = formData.get("links");
   await SUB.put("vpn_links", newLinks);
-  return new Response("Links updated successfully!", {
+  return new Response("Mixed configs updated successfully!", {
     headers: { "content-type": "text/plain; charset=UTF-8" },
   });
 }
