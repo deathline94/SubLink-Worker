@@ -2,11 +2,11 @@
 
 # 🔗 SubLink Worker
 
-### A tiny Cloudflare Worker for hosting your own VPN subscription link
+### A high-performance Cloudflare Worker for hosting custom VPN subscription links
 
-Paste configs. Save to KV. Share one clean subscription URL.
+Paste node configs. Save to KV. Share clean subscription endpoints with auto Base64 negotiation.
 
-[Setup](#-setup) • [Supported Input](#-supported-input) • [Notes](#-notes) • [Local Checks](#-local-checks)
+[Setup](#-setup) • [Supported Protocols](#-supported-protocols) • [Client Endpoints](#-client-endpoints) • [Local Tests](#-local-tests)
 
 </div>
 
@@ -14,35 +14,34 @@ Paste configs. Save to KV. Share one clean subscription URL.
 
 ## ✨ What It Does
 
-**SubLink Worker** gives you a simple admin panel for managing a public VPN subscription endpoint.
+**SubLink Worker** provides a secure, minimal admin panel and edge API for managing VPN subscription feeds.
 
-- 🔐 Password-protected admin panel at `/admin`
-- 🌐 Public subscription output from `/` and `/sub`
-- 💾 Cloudflare KV storage
-- 🧾 Raw output, exactly as entered
-- 📥 Import and export
-- 🧪 Validation hints and protocol counts
-- ♻️ Previous-save backup restore
-- ⚡ One `Worker.js` file, no build step
+- 🔐 **Hardened Auth**: PBKDF2 key derivation (100,000 iterations), automatic legacy password migration, CSRF token validation, and IP-isolated rate limiting.
+- 🌐 **Dual Format Delivery**: Serves raw subscription text or standard Base64 encoding via query parameter or client User-Agent negotiation.
+- ⚡ **ES Module & Legacy Runtime**: Native `export default { fetch }` with Service Worker listener fallback.
+- 🎨 **Polished Dashboard**: Slate Blue theme, tabular monospace metrics, protocol breakdowns, and instant rollback.
+- 🧪 **Zero-Dependency Tests**: Built-in test suite running on native Node.js (`node --test`).
+- 💾 **Single File Deployment**: Zero build step; copy-paste directly into Cloudflare Worker web editor.
 
 ---
 
-## 📦 Supported Input
+## 📦 Supported Protocols
 
-SubLink Worker is a **raw subscription host**. It does not convert between client formats.
-
-You can paste normal share links:
+SubLink Worker validates and counts all modern proxy share links and configurations:
 
 ```text
 vless://...
 vmess://...
 trojan://...
 ss://...
-hysteria2://...
-wireguard://...
+ssr://...
+hysteria2://... (or hy2://)
+wireguard://... (or wg://)
+socks5://...
+http:// / https://
 ```
 
-You can also store JSON configs. Just be careful with mixed formats: most clients expect one subscription style at a time, so mixing URI links and full JSON configs may not import correctly.
+Raw JSON configurations (e.g., sing-box / Xray outbounds) are also supported and parsed for node counts.
 
 ---
 
@@ -50,17 +49,13 @@ You can also store JSON configs. Just be careful with mixed formats: most client
 
 ### 1. Create a KV Namespace
 
-In Cloudflare:
+In the Cloudflare Dashboard:
 
 ```text
 Workers & Pages -> KV -> Create namespace
 ```
 
-Example namespace name:
-
-```text
-sub
-```
+Namespace name: `sub`
 
 ### 2. Create a Worker
 
@@ -68,26 +63,20 @@ sub
 Workers & Pages -> Create -> Worker
 ```
 
-Create a normal Worker and open the editor.
+Delete the default code, paste the contents of [`Worker.js`](./Worker.js), and deploy.
 
-### 3. Paste the Code
+### 3. Bind KV
 
-Delete the starter code and paste the contents of [`Worker.js`](./Worker.js).
+Open **Worker Settings -> Variables -> KV Namespace Bindings**:
 
-Save and deploy.
+- **Variable name**: `sub`
+- **KV namespace**: your created KV namespace
 
-### 4. Bind KV
+### 4. (Optional) Set `AUTH_SECRET`
 
-Open the Worker settings and add a KV binding:
+Add an environment variable `AUTH_SECRET` with a strong random string to enable HMAC defense-in-depth key derivation.
 
-```text
-Variable name: sub
-KV namespace: your KV namespace
-```
-
-The variable name must be exactly `sub`.
-
-### 5. Open the Admin Panel
+### 5. Access the Admin Panel
 
 Visit:
 
@@ -95,51 +84,33 @@ Visit:
 https://your-worker-url/admin
 ```
 
-Set your admin password, paste your configs, and save.
-
-Your subscription URL is:
-
-```text
-https://your-worker-url/
-```
-
-or:
-
-```text
-https://your-worker-url/sub
-```
+Set your admin password, paste your node links, and click **Save nodes**.
 
 ---
 
-## 🔑 Optional `AUTH_SECRET`
+## 📡 Client Endpoints
 
-For stronger password protection, add an environment variable named `AUTH_SECRET`.
+SubLink Worker provides two subscription formats:
 
-Use a long random value from a password manager:
-
-```text
-AUTH_SECRET=your-long-random-secret
-```
-
-The Worker still works without it.
-
----
-
-## 📝 Notes
-
-- The subscription URL is public so VPN clients can fetch it without logging in.
-- The admin panel is protected by password login.
-- Cloudflare KV may take a little time to sync globally after saving.
-- The Worker serves raw content. If your client expects Base64, Clash YAML, sing-box JSON, or another format, save content in that exact format.
+1. **Raw Text Endpoint** (Default):
+   ```text
+   https://your-worker-url/
+   https://your-worker-url/sub
+   ```
+2. **Base64 Encoded Endpoint** (For Shadowrocket, v2rayN, Quantumult X, Streisand, etc.):
+   ```text
+   https://your-worker-url/?b64=1
+   ```
+   *Note: Known VPN client User-Agents requesting the root endpoint automatically receive Base64 output.*
 
 ---
 
-## 🧪 Local Checks
+## 🧪 Local Tests
 
-No dependencies are required for a quick syntax check.
+Run the built-in test suite with native Node.js (v18+):
 
 ```bash
-node --check Worker.js
+node --test test.js
 ```
 
 ---

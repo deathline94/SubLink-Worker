@@ -1,30 +1,59 @@
-const GLOBAL_KV = typeof sub !== "undefined" ? sub : null;
-const GLOBAL_AUTH_SECRET =
-  typeof AUTH_SECRET !== "undefined" ? String(AUTH_SECRET || "") : "";
-
 const APP_NAME = "SubLink Worker";
+const APP_VERSION = "2.0.0";
 const SESSION_COOKIE = "__Host-sublink_session";
 const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
 const LOGIN_WINDOW_SECONDS = 15 * 60;
 const LOGIN_MAX_FAILURES = 8;
 const MAX_LINKS_BYTES = 24 * 1024 * 1024;
+const PBKDF2_ITERATIONS = 100000;
+
 const SUPPORTED_PROTOCOLS = [
   "vless",
   "vmess",
   "ss",
+  "ssr",
   "trojan",
   "hysteria2",
   "hy2",
   "hysteria",
   "tuic",
   "wireguard",
+  "wg",
+  "socks5",
+  "socks",
+  "http",
+  "https",
 ];
 
+const KNOWN_B64_CLIENT_AGENTS = [
+  "v2rayn",
+  "v2rayng",
+  "shadowrocket",
+  "quantumult",
+  "streisand",
+  "loon",
+  "surfboard",
+  "kitsunebi",
+  "sagernet",
+  "nekobox",
+  "sing-box",
+  "clash",
+  "stash",
+  "hiddify",
+];
+
+// Dual runtime support: Service Worker listener + ES Module export
 if (typeof addEventListener === "function") {
   addEventListener("fetch", (event) => {
-    event.respondWith(handleRequest(event.request));
+    event.respondWith(handleRequest(event.request, getDefaultEnv()));
   });
 }
+
+export default {
+  async fetch(request, env = {}, ctx) {
+    return handleRequest(request, env);
+  },
+};
 
 async function handleRequest(request, env = getDefaultEnv()) {
   const url = new URL(request.url);
@@ -39,7 +68,7 @@ async function handleRequest(request, env = getDefaultEnv()) {
 
     if (path === "/" || path === "/sub") {
       return request.method === "GET"
-        ? generateSubscription(env)
+        ? generateSubscription(request, env)
         : methodNotAllowed(["GET"]);
     }
 
@@ -100,8 +129,8 @@ async function handleRequest(request, env = getDefaultEnv()) {
 
 function getDefaultEnv() {
   return {
-    sub: GLOBAL_KV,
-    AUTH_SECRET: GLOBAL_AUTH_SECRET,
+    sub: typeof sub !== "undefined" ? sub : null,
+    AUTH_SECRET: typeof AUTH_SECRET !== "undefined" ? String(AUTH_SECRET || "") : "",
   };
 }
 
@@ -113,59 +142,88 @@ function normalizePath(pathname) {
 }
 
 function getKV(env) {
-  return env && env.sub && typeof env.sub.get === "function" ? env.sub : null;
+  if (env && env.sub && typeof env.sub.get === "function") return env.sub;
+  if (typeof sub !== "undefined" && sub && typeof sub.get === "function") return sub;
+  return null;
 }
+
+function hasAuthSecret(env) {
+  return !!(env && typeof env.AUTH_SECRET === "string" && env.AUTH_SECRET.trim());
+}
+
+function authSecretWarning(env) {
+  return hasAuthSecret(env)
+    ? ""
+    : "Optional AUTH_SECRET is not configured. PBKDF2 hashing is active, but AUTH_SECRET provides extra defense-in-depth.";
+}
+
+// ---------------------------------------------------------------------------
+// Route Handlers
+// ---------------------------------------------------------------------------
 
 async function handleAdminPage(request, env) {
   const nonce = randomBase64Url(18);
   const kv = getKV(env);
 
   if (!kv) {
-    return htmlResponse(generateAdminErrorPage({
-      nonce,
-      title: "KV binding missing",
-      details: [
-        'Create a Cloudflare KV namespace and bind it to this Worker as "sub".',
-        "The public subscription cannot be stored until that binding exists.",
-      ],
-    }), { nonce, status: 503 });
+    return htmlResponse(
+      generateAdminErrorPage({
+        nonce,
+        title: "KV binding missing",
+        details: [
+          'Create a Cloudflare KV namespace and bind it to this Worker with the variable name "sub".',
+          "The public subscription and settings cannot be saved until this binding exists.",
+        ],
+      }),
+      { nonce, status: 503 }
+    );
   }
 
   const passwordEntry = await loadPasswordEntry(kv);
   if (passwordEntry.kind === "missing") {
-    return htmlResponse(generateAuthPage({
-      mode: "setup",
-      nonce,
-      warning: authSecretWarning(env),
-    }), { nonce });
+    return htmlResponse(
+      generateAuthPage({
+        mode: "setup",
+        nonce,
+        warning: authSecretWarning(env),
+      }),
+      { nonce }
+    );
   }
 
   const session = await getSession(request, kv);
   if (!session) {
-    return htmlResponse(generateAuthPage({
-      mode: "login",
-      nonce,
-      warning: authSecretWarning(env),
-    }), { nonce });
+    return htmlResponse(
+      generateAuthPage({
+        mode: "login",
+        nonce,
+        warning: authSecretWarning(env),
+      }),
+      { nonce }
+    );
   }
 
   const links = await kvGet(kv, "vpn_links", "");
   const backup = await kvGet(kv, "vpn_links_backup", null);
   const storedMeta = await kvGetJson(kv, "vpn_meta", null);
   const validation = validateSubscriptionContent(links);
-  const meta =
-    storedMeta || (await buildMetadata(links, validation));
+  const meta = storedMeta || (await buildMetadata(links, validation));
+  const url = new URL(request.url);
 
-  return htmlResponse(generateDashboardPage({
-    nonce,
-    csrfToken: session.data.csrfToken,
-    links,
-    hasBackup: backup !== null,
-    meta,
-    validation,
-    subscriptionUrl: `${new URL(request.url).origin}/`,
-    hasAuthSecret: hasAuthSecret(env),
-  }), { nonce });
+  return htmlResponse(
+    generateDashboardPage({
+      nonce,
+      csrfToken: session.data.csrfToken,
+      links,
+      hasBackup: backup !== null,
+      meta,
+      validation,
+      subscriptionUrl: `${url.origin}/`,
+      base64Url: `${url.origin}/?b64=1`,
+      hasAuthSecret: hasAuthSecret(env),
+    }),
+    { nonce }
+  );
 }
 
 async function handleSetup(request, env) {
@@ -182,15 +240,19 @@ async function handleSetup(request, env) {
   const validationError = validatePassword(password);
   if (validationError) {
     const nonce = randomBase64Url(18);
-    return htmlResponse(generateAuthPage({
-      mode: "setup",
-      nonce,
-      error: validationError,
-      warning: authSecretWarning(env),
-    }), { nonce, status: 400 });
+    return htmlResponse(
+      generateAuthPage({
+        mode: "setup",
+        nonce,
+        error: validationError,
+        warning: authSecretWarning(env),
+      }),
+      { nonce, status: 400 }
+    );
   }
 
-  await kv.put("admin_password", JSON.stringify(await createPasswordRecord(password, env)));
+  const record = await createPasswordRecord(password, env);
+  await kv.put("admin_password", JSON.stringify(record));
   const session = await createSession(kv);
   return redirectToAdmin(session.cookie);
 }
@@ -199,22 +261,28 @@ async function handleLogin(request, env) {
   const kv = getKV(env);
   const nonce = randomBase64Url(18);
   if (!kv) {
-    return htmlResponse(generateAdminErrorPage({
-      nonce,
-      title: "KV binding missing",
-      details: ['Bind a KV namespace named "sub" before signing in.'],
-    }), { nonce, status: 503 });
+    return htmlResponse(
+      generateAdminErrorPage({
+        nonce,
+        title: "KV binding missing",
+        details: ['Bind a KV namespace named "sub" before signing in.'],
+      }),
+      { nonce, status: 503 }
+    );
   }
 
   const clientKey = await loginThrottleKey(request);
   const throttle = await readLoginThrottle(kv, clientKey);
   if (throttle.blocked) {
-    return htmlResponse(generateAuthPage({
-      mode: "login",
-      nonce,
-      error: "Too many sign-in attempts. Try again in a few minutes.",
-      warning: authSecretWarning(env),
-    }), { nonce, status: 429 });
+    return htmlResponse(
+      generateAuthPage({
+        mode: "login",
+        nonce,
+        error: "Too many sign-in attempts. Try again in 15 minutes.",
+        warning: authSecretWarning(env),
+      }),
+      { nonce, status: 429 }
+    );
   }
 
   const form = await safeFormData(request);
@@ -228,16 +296,21 @@ async function handleLogin(request, env) {
   const verification = await verifyPasswordEntry(password, entry, env);
   if (!verification.ok) {
     await recordLoginFailure(kv, clientKey, throttle.count);
-    return htmlResponse(generateAuthPage({
-      mode: "login",
-      nonce,
-      error: "Unable to sign in with those credentials.",
-      warning: authSecretWarning(env),
-    }), { nonce, status: 401 });
+    return htmlResponse(
+      generateAuthPage({
+        mode: "login",
+        nonce,
+        error: "Invalid credentials.",
+        warning: authSecretWarning(env),
+      }),
+      { nonce, status: 401 }
+    );
   }
 
-  if (entry.kind === "legacy") {
-    await kv.put("admin_password", JSON.stringify(await createPasswordRecord(password, env)));
+  // Transparently rehash legacy or v2 passwords to modern PBKDF2
+  if (!verification.migrated) {
+    const modernRecord = await createPasswordRecord(password, env);
+    await kv.put("admin_password", JSON.stringify(modernRecord));
   }
 
   await clearLoginThrottle(kv, clientKey);
@@ -280,8 +353,9 @@ async function handlePasswordChange(request, env) {
     return jsonResponse({ ok: false, error: "Current password did not match." }, { status: 401 });
   }
 
-  await kv.put("admin_password", JSON.stringify(await createPasswordRecord(newPassword, env)));
-  return jsonResponse({ ok: true, message: "Password updated." });
+  const record = await createPasswordRecord(newPassword, env);
+  await kv.put("admin_password", JSON.stringify(record));
+  return jsonResponse({ ok: true, message: "Password updated successfully." });
 }
 
 async function handleUpdateLinks(request, env) {
@@ -346,7 +420,7 @@ async function handleRestoreBackup(request, env) {
   return jsonResponse({ ok: true, links: backup, meta, validation });
 }
 
-async function generateSubscription(env) {
+async function generateSubscription(request, env) {
   const kv = getKV(env);
   if (!kv) {
     return textResponse("KV binding missing. Bind a namespace named sub.", {
@@ -356,14 +430,36 @@ async function generateSubscription(env) {
   }
 
   const rawContent = await kvGet(kv, "vpn_links", "");
-  return textResponse(rawContent, {
+  const url = new URL(request.url);
+  const userAgent = (request.headers.get("User-Agent") || "").toLowerCase();
+
+  const wantsBase64 =
+    url.searchParams.get("b64") === "1" ||
+    url.searchParams.get("format") === "base64" ||
+    KNOWN_B64_CLIENT_AGENTS.some((agent) => userAgent.includes(agent));
+
+  let body = rawContent;
+  let filename = "subscription.txt";
+
+  if (wantsBase64 && rawContent.trim()) {
+    body = base64EncodeUtf8(rawContent);
+    filename = "subscription.b64";
+  }
+
+  return textResponse(body, {
     headers: {
       "cache-control": "no-store",
       "profile-update-interval": "24",
       "subscription-userinfo": "upload=0; download=0; total=0; expire=0",
+      "content-disposition": `inline; filename="${filename}"`,
+      "profile-title": "SubLink Subscription",
     },
   });
 }
+
+// ---------------------------------------------------------------------------
+// Helpers & Data Access
+// ---------------------------------------------------------------------------
 
 async function safeFormData(request) {
   try {
@@ -383,7 +479,6 @@ async function safeRequestInput(request) {
       return null;
     }
   }
-
   return safeFormData(request);
 }
 
@@ -408,18 +503,13 @@ function getFormString(form, key) {
 
 function validatePassword(password) {
   if (!password) return "Password is required.";
+  if (password.length < 8) return "Password must be at least 8 characters long.";
   return "";
 }
 
-function hasAuthSecret(env) {
-  return !!(env && typeof env.AUTH_SECRET === "string" && env.AUTH_SECRET.trim());
-}
-
-function authSecretWarning(env) {
-  return hasAuthSecret(env)
-    ? ""
-    : "Optional AUTH_SECRET is not configured. Passwords are still salted, but adding AUTH_SECRET improves protection if KV data is exposed.";
-}
+// ---------------------------------------------------------------------------
+// Security & Authentication
+// ---------------------------------------------------------------------------
 
 async function loadPasswordEntry(kv) {
   const raw = await kvGet(kv, "admin_password", null);
@@ -427,24 +517,27 @@ async function loadPasswordEntry(kv) {
 
   try {
     const parsed = JSON.parse(raw);
-    if (parsed && parsed.version === 2 && parsed.salt && parsed.hash && parsed.algorithm) {
+    if (parsed && parsed.salt && parsed.hash) {
       return { kind: "hashed", record: parsed };
     }
   } catch (_error) {
-    // Legacy versions stored the password directly as plain text.
+    // Legacy plaintext password format
   }
 
   return { kind: "legacy", password: raw };
 }
 
 async function createPasswordRecord(password, env) {
-  const salt = randomBase64Url(16);
-  const algorithm = hasAuthSecret(env) ? "hmac-sha256" : "salted-sha256";
-  const hash = await hashPassword(password, salt, env, algorithm);
+  const saltBytes = new Uint8Array(16);
+  crypto.getRandomValues(saltBytes);
+  const salt = base64UrlEncodeBytes(saltBytes);
+
+  const hash = await hashPasswordPBKDF2(password, salt, env);
 
   return {
-    version: 2,
-    algorithm,
+    version: 3,
+    algorithm: "pbkdf2-sha256",
+    iterations: PBKDF2_ITERATIONS,
     salt,
     hash,
     createdAt: new Date().toISOString(),
@@ -459,11 +552,51 @@ async function verifyPasswordEntry(password, entry, env) {
   }
 
   const record = entry.record;
-  const hash = await hashPassword(password, record.salt, env, record.algorithm);
-  return { ok: constantTimeEqual(hash, record.hash), migrated: true };
+
+  // v3: PBKDF2
+  if (record.version === 3 || record.algorithm === "pbkdf2-sha256") {
+    const computed = await hashPasswordPBKDF2(password, record.salt, env, record.iterations || PBKDF2_ITERATIONS);
+    return { ok: constantTimeEqual(computed, record.hash), migrated: true };
+  }
+
+  // v2: Legacy salted SHA-256 or HMAC
+  if (record.version === 2) {
+    const computed = await hashPasswordV2Legacy(password, record.salt, env, record.algorithm);
+    return { ok: constantTimeEqual(computed, record.hash), migrated: false };
+  }
+
+  return { ok: false, migrated: false };
 }
 
-async function hashPassword(password, salt, env, algorithm) {
+async function hashPasswordPBKDF2(password, salt, env, iterations = PBKDF2_ITERATIONS) {
+  const secretKey = hasAuthSecret(env) ? env.AUTH_SECRET : "";
+  const combinedPassword = secretKey ? `${password}:${secretKey}` : password;
+  const pwUtf8 = encodeText(combinedPassword);
+  const saltUtf8 = encodeText(salt);
+
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    pwUtf8,
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: saltUtf8,
+      iterations,
+      hash: "SHA-256",
+    },
+    keyMaterial,
+    256
+  );
+
+  return base64UrlEncodeBytes(new Uint8Array(derivedBits));
+}
+
+async function hashPasswordV2Legacy(password, salt, env, algorithm) {
   const material = `${salt}:${password}`;
 
   if (algorithm === "hmac-sha256") {
@@ -549,11 +682,9 @@ function expireSessionCookie() {
 }
 
 async function loginThrottleKey(request) {
-  const ip =
-    request.headers.get("CF-Connecting-IP") ||
-    request.headers.get("X-Forwarded-For") ||
-    "unknown";
-  const userAgent = request.headers.get("User-Agent") || "unknown";
+  // Use Cloudflare connecting IP directly; do NOT blindly trust X-Forwarded-For to prevent IP spoofing
+  const ip = request.headers.get("CF-Connecting-IP") || "direct-ip";
+  const userAgent = request.headers.get("User-Agent") || "generic";
   return `login_fail:${await sha256Hex(`${ip}|${userAgent}`)}`;
 }
 
@@ -564,10 +695,14 @@ async function readLoginThrottle(kv, key) {
 }
 
 async function recordLoginFailure(kv, key, currentCount) {
-  await kv.put(key, JSON.stringify({
-    count: currentCount + 1,
-    updatedAt: new Date().toISOString(),
-  }), { expirationTtl: LOGIN_WINDOW_SECONDS });
+  await kv.put(
+    key,
+    JSON.stringify({
+      count: currentCount + 1,
+      updatedAt: new Date().toISOString(),
+    }),
+    { expirationTtl: LOGIN_WINDOW_SECONDS }
+  );
 }
 
 async function clearLoginThrottle(kv, key) {
@@ -586,6 +721,10 @@ function parseCookies(header) {
   return cookies;
 }
 
+// ---------------------------------------------------------------------------
+// KV Operations
+// ---------------------------------------------------------------------------
+
 async function kvGet(kv, key, fallback) {
   const value = await kv.get(key);
   return value === null || typeof value === "undefined" ? fallback : value;
@@ -594,7 +733,6 @@ async function kvGet(kv, key, fallback) {
 async function kvGetJson(kv, key, fallback) {
   const value = await kvGet(kv, key, null);
   if (value === null) return fallback;
-
   try {
     return JSON.parse(value);
   } catch (_error) {
@@ -613,6 +751,10 @@ async function buildMetadata(content, validation = validateSubscriptionContent(c
   };
 }
 
+// ---------------------------------------------------------------------------
+// Subscription Content Validation & Parsing
+// ---------------------------------------------------------------------------
+
 function validateSubscriptionContent(content) {
   const text = typeof content === "string" ? content : "";
   const byteSize = byteLength(text);
@@ -627,11 +769,11 @@ function validateSubscriptionContent(content) {
   };
 
   if (byteSize > MAX_LINKS_BYTES) {
-    result.errors.push(`Content is ${formatBytes(byteSize)}, exceeding the 24 MiB save limit.`);
+    result.errors.push(`Content size (${formatBytes(byteSize)}) exceeds the 24 MiB limit.`);
   }
 
   if (result.isEmpty) {
-    result.warnings.push("Subscription is empty.");
+    result.warnings.push("Subscription is currently empty.");
     return result;
   }
 
@@ -679,11 +821,11 @@ function recordLine(line, lineNumber, seen, result) {
   }
 
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(line)) {
-    pushWarning(result, `Unsupported protocol on line ${lineNumber}: ${line.slice(0, 48)}`);
+    pushWarning(result, `Unsupported protocol on line ${lineNumber}: ${line.slice(0, 40)}`);
     return;
   }
 
-  pushWarning(result, `Unknown content on line ${lineNumber}: ${line.slice(0, 48)}`);
+  pushWarning(result, `Unknown format on line ${lineNumber}: ${line.slice(0, 40)}`);
 }
 
 function recordJsonBlock(rawBlock, lineNumber, result) {
@@ -703,7 +845,7 @@ function recordJsonBlock(rawBlock, lineNumber, result) {
 function recordDuplicate(value, seen, result) {
   if (!value) return;
   if (seen.has(value)) {
-    pushWarning(result, `Duplicate entry detected: ${value.slice(0, 48)}`);
+    pushWarning(result, `Duplicate entry detected: ${value.slice(0, 40)}...`);
     return;
   }
   seen.add(value);
@@ -778,14 +920,18 @@ function pushWarning(result, message) {
   if (result.warnings.length < 50) result.warnings.push(message);
 }
 
+// ---------------------------------------------------------------------------
+// HTML Views & Redesigned Slate Blue UI
+// ---------------------------------------------------------------------------
+
 function generateAuthPage({ mode, nonce, error = "", warning = "" }) {
   const isSetup = mode === "setup";
-  const title = isSetup ? "Set Admin Password" : "Admin Sign In";
+  const title = isSetup ? "Setup admin password" : "Sign in to SubLink";
   const action = isSetup ? "/admin/setup" : "/admin/login";
-  const button = isSetup ? "Create Password" : "Sign In";
+  const button = isSetup ? "Set Admin Password" : "Sign In";
   const hint = isSetup
-    ? "Create the first admin password for this Worker."
-    : "Sign in to manage the public subscription output.";
+    ? "Initialize the primary administrator password for your subscription worker."
+    : "Enter your admin credentials to update your proxy nodes.";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -796,18 +942,33 @@ function generateAuthPage({ mode, nonce, error = "", warning = "" }) {
   <style nonce="${nonce}">${baseStyles()}</style>
 </head>
 <body class="auth-screen">
-  <main class="auth-panel" aria-labelledby="auth-title">
-    <div class="brand-mark" aria-hidden="true">SL</div>
-    <h1 id="auth-title">${title}</h1>
-    <p>${hint}</p>
-    ${error ? `<div class="notice error">${escapeHtml(error)}</div>` : ""}
-    ${warning ? `<div class="notice warning">${escapeHtml(warning)}</div>` : ""}
-    <form method="POST" action="${action}" class="stack">
-      <label for="password">Password</label>
-      <input id="password" name="password" type="password" autocomplete="${isSetup ? "new-password" : "current-password"}" required>
-      <button class="primary-button" type="submit">${button}</button>
+  <div class="auth-card">
+    <div class="brand-row">
+      <div class="brand-badge">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+        </svg>
+      </div>
+      <span class="brand-title">${APP_NAME}</span>
+      <span class="version-tag">v${APP_VERSION}</span>
+    </div>
+
+    <h1>${title}</h1>
+    <p class="subtitle">${hint}</p>
+
+    ${error ? `<div class="alert alert-error" role="alert">${escapeHtml(error)}</div>` : ""}
+    ${warning ? `<div class="alert alert-warning" role="alert">${escapeHtml(warning)}</div>` : ""}
+
+    <form method="POST" action="${action}" class="form-stack">
+      <div class="field-group">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="${isSetup ? "new-password" : "current-password"}" placeholder="••••••••••••" required autofocus>
+        ${isSetup ? '<span class="field-hint">Minimum 8 characters. Uses PBKDF2-SHA256 key derivation.</span>' : ""}
+      </div>
+      <button class="btn btn-primary" type="submit">${button}</button>
     </form>
-  </main>
+  </div>
 </body>
 </html>`;
 }
@@ -818,15 +979,21 @@ function generateAdminErrorPage({ nonce, title, details }) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${APP_NAME} - Setup Required</title>
+  <title>${APP_NAME} - Missing Configuration</title>
   <style nonce="${nonce}">${baseStyles()}</style>
 </head>
 <body class="auth-screen">
-  <main class="auth-panel" aria-labelledby="error-title">
-    <div class="brand-mark" aria-hidden="true">SL</div>
-    <h1 id="error-title">${escapeHtml(title)}</h1>
-    ${details.map((item) => `<p>${escapeHtml(item)}</p>`).join("")}
-  </main>
+  <div class="auth-card">
+    <div class="brand-row">
+      <div class="brand-badge danger">!</div>
+      <span class="brand-title">${APP_NAME}</span>
+    </div>
+    <h1>${escapeHtml(title)}</h1>
+    <div class="alert alert-warning">
+      ${details.map((item) => `<p style="margin:4px 0">${escapeHtml(item)}</p>`).join("")}
+    </div>
+    <p class="subtitle">Once configured, reload this page to continue.</p>
+  </div>
 </body>
 </html>`;
 }
@@ -839,6 +1006,7 @@ function generateDashboardPage({
   meta,
   validation,
   subscriptionUrl,
+  base64Url,
   hasAuthSecret,
 }) {
   const initialState = {
@@ -847,6 +1015,7 @@ function generateDashboardPage({
     meta,
     validation,
     subscriptionUrl,
+    base64Url,
     hasAuthSecret,
   };
 
@@ -856,467 +1025,672 @@ function generateDashboardPage({
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="csrf-token" content="${escapeHtml(csrfToken)}">
-  <title>${APP_NAME} - Admin</title>
+  <title>${APP_NAME} - Dashboard</title>
   <style nonce="${nonce}">${baseStyles()}${dashboardStyles()}</style>
 </head>
-<body class="dashboard-screen">
-  <header class="topbar">
-    <div>
-      <div class="eyebrow">Cloudflare Worker</div>
-      <h1>${APP_NAME}</h1>
-    </div>
-    <div class="topbar-actions">
-      <span id="save-state" class="state-pill clean">Saved</span>
-      <button id="logout-button" class="ghost-button" type="button">Logout</button>
+<body class="dashboard-body">
+  <header class="app-header">
+    <div class="header-content">
+      <div class="header-brand">
+        <div class="brand-badge">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+            <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+          </svg>
+        </div>
+        <div class="brand-text">
+          <span class="brand-title">${APP_NAME}</span>
+          <span class="brand-sub">Cloudflare Edge Worker</span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <div id="save-status-pill" class="status-pill status-saved">Synced</div>
+        <button id="logout-btn" class="btn btn-ghost btn-sm" type="button">Sign out</button>
+      </div>
     </div>
   </header>
 
-  <main class="workspace">
-    <section class="editor-panel" aria-labelledby="editor-title">
-      <div class="panel-header">
-        <div>
-          <h2 id="editor-title">Subscription Content</h2>
-          <p>Public raw output is served from <code>/</code> and <code>/sub</code>.</p>
+  <main class="app-layout">
+    <div class="main-column">
+      <section class="card editor-card">
+        <div class="card-header">
+          <div>
+            <h2>Subscription nodes</h2>
+            <p class="section-desc">Nodes served to your VPN clients. Supports URIs (vless, vmess, trojan, ss, hy2) and raw JSON.</p>
+          </div>
+          <div class="toolbar">
+            <button id="btn-import" class="btn btn-secondary btn-sm" type="button">Import</button>
+            <button id="btn-export" class="btn btn-secondary btn-sm" type="button">Export</button>
+            <button id="btn-restore" class="btn btn-secondary btn-sm" type="button"${hasBackup ? "" : " disabled"}>Rollback</button>
+          </div>
         </div>
-        <div class="toolbar">
-          <button id="import-button" class="ghost-button" type="button">Import</button>
-          <button id="export-button" class="ghost-button" type="button">Export</button>
-          <button id="validate-button" class="ghost-button" type="button">Validate</button>
-          <button id="restore-button" class="ghost-button" type="button"${hasBackup ? "" : " disabled"}>Restore</button>
-        </div>
-      </div>
 
-      <form id="links-form">
-        <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
-        <textarea id="links-box" name="links" spellcheck="false" placeholder="Paste vless://, vmess://, ss://, trojan://, hysteria2://, wireguard://, or JSON configs here.">${escapeHtml(links)}</textarea>
-        <div class="editor-actions">
-          <button id="clear-button" class="danger-button" type="button">Clear</button>
-          <button id="save-button" class="primary-button" type="submit">Save Changes</button>
-        </div>
-      </form>
-    </section>
-
-    <aside class="status-rail" aria-label="Subscription status">
-      <section class="stat-block">
-        <h2>Status</h2>
-        <div class="metric-grid">
-          <div><span>Configs</span><strong id="config-count">${validation.configCount}</strong></div>
-          <div><span>Size</span><strong id="byte-size">${escapeHtml(formatBytes(validation.byteSize))}</strong></div>
-          <div><span>Warnings</span><strong id="warning-count">${validation.warnings.length}</strong></div>
-          <div><span>Updated</span><strong id="updated-at">${escapeHtml(formatDate(meta.updatedAt))}</strong></div>
-        </div>
-      </section>
-
-      <section class="stat-block">
-        <h2>Public URL</h2>
-        <div class="copy-row">
-          <input id="subscription-url" value="${escapeHtml(subscriptionUrl)}" readonly>
-          <button id="copy-button" class="ghost-button" type="button">Copy</button>
-        </div>
-        <p class="fine-print">Root output remains public by project choice. Cloudflare KV changes can take 60 seconds or more to appear globally.</p>
-      </section>
-
-      <section class="stat-block">
-        <h2>Protocol Mix</h2>
-        <div id="protocol-list" class="protocol-list"></div>
-      </section>
-
-      <section class="stat-block">
-        <h2>Validation</h2>
-        <div id="validation-list" class="validation-list"></div>
-      </section>
-
-      <section class="stat-block">
-        <h2>Security</h2>
-        <p id="auth-secret-state" class="fine-print"></p>
-        <form id="password-form" class="stack compact">
+        <form id="editor-form">
           <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
-          <label for="current-password">Current password</label>
-          <input id="current-password" name="current_password" type="password" autocomplete="current-password">
-          <label for="new-password">New password</label>
-          <input id="new-password" name="new_password" type="password" autocomplete="new-password">
-          <button class="ghost-button" type="submit">Change Password</button>
+          <div class="textarea-wrapper">
+            <textarea id="links-editor" name="links" spellcheck="false" placeholder="Paste vless://, vmess://, ss://, trojan://, hysteria2://, or JSON configs here...">${escapeHtml(links)}</textarea>
+          </div>
+          <div class="editor-footer">
+            <div class="editor-footer-left">
+              <span id="char-counter" class="mono-stat">0 lines</span>
+            </div>
+            <div class="editor-footer-right">
+              <button id="btn-clear" class="btn btn-danger btn-sm" type="button">Clear</button>
+              <button id="btn-save" class="btn btn-primary btn-sm" type="submit">Save nodes</button>
+            </div>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <aside class="side-column">
+      <section class="card">
+        <div class="card-header-simple">
+          <h3>Quick stats</h3>
+        </div>
+        <div class="stat-grid">
+          <div class="stat-box">
+            <span class="stat-label">Nodes</span>
+            <span id="stat-nodes" class="stat-val mono-stat">${validation.configCount}</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Payload</span>
+            <span id="stat-size" class="stat-val mono-stat">${escapeHtml(formatBytes(validation.byteSize))}</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Issues</span>
+            <span id="stat-issues" class="stat-val mono-stat">${validation.warnings.length}</span>
+          </div>
+          <div class="stat-box">
+            <span class="stat-label">Last Saved</span>
+            <span id="stat-saved" class="stat-val-sm mono-stat">${escapeHtml(formatDate(meta.updatedAt))}</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header-simple">
+          <h3>Client subscription URLs</h3>
+        </div>
+        <div class="url-block">
+          <label for="sub-url-raw">Raw Endpoint (Default)</label>
+          <div class="input-action-row">
+            <input id="sub-url-raw" class="mono-input" value="${escapeHtml(subscriptionUrl)}" readonly>
+            <button class="btn btn-secondary btn-sm copy-btn" data-target="sub-url-raw" type="button">Copy</button>
+          </div>
+        </div>
+        <div class="url-block" style="margin-top:12px;">
+          <label for="sub-url-b64">Base64 Encoded (Shadowrocket / v2rayN)</label>
+          <div class="input-action-row">
+            <input id="sub-url-b64" class="mono-input" value="${escapeHtml(base64Url)}" readonly>
+            <button class="btn btn-secondary btn-sm copy-btn" data-target="sub-url-b64" type="button">Copy</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-header-simple">
+          <h3>Protocol breakdown</h3>
+        </div>
+        <div id="protocol-container" class="pill-list"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header-simple">
+          <h3>Diagnostics</h3>
+        </div>
+        <div id="diagnostics-container" class="diagnostic-list"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-header-simple">
+          <h3>Security settings</h3>
+        </div>
+        <p id="sec-notice" class="sec-status-text"></p>
+        <form id="change-pw-form" class="form-stack compact">
+          <input type="hidden" name="csrf_token" value="${escapeHtml(csrfToken)}">
+          <div class="field-group">
+            <label for="current_password">Current password</label>
+            <input id="current_password" name="current_password" type="password" autocomplete="current-password" required>
+          </div>
+          <div class="field-group">
+            <label for="new_password">New password</label>
+            <input id="new_password" name="new_password" type="password" autocomplete="new-password" required>
+          </div>
+          <button class="btn btn-secondary btn-sm" type="submit">Update password</button>
         </form>
       </section>
     </aside>
   </main>
 
-  <div id="notifications" aria-live="polite" aria-atomic="true"></div>
-  <input id="file-input" type="file" accept=".txt,.json" hidden>
-  <script id="sublink-state" type="application/json" nonce="${nonce}">${safeJsonForScript(initialState)}</script>
+  <div id="toast-shelf" aria-live="polite" aria-atomic="true"></div>
+  <input id="hidden-file-input" type="file" accept=".txt,.json,.conf" hidden>
+
+  <script id="sublink-data" type="application/json" nonce="${nonce}">${safeJsonForScript(initialState)}</script>
   <script nonce="${nonce}">${dashboardScript()}</script>
 </body>
 </html>`;
 }
 
+// ---------------------------------------------------------------------------
+// Redesigned Slate Blue Stylesheet
+// ---------------------------------------------------------------------------
+
 function baseStyles() {
   return `
 :root {
   color-scheme: dark;
-  --bg: #090b0f;
-  --surface: #111620;
-  --surface-2: #171e2a;
-  --border: #263244;
-  --text: #f5f7fb;
-  --muted: #9aa7b8;
-  --accent: #20d0a8;
-  --accent-2: #5aa7ff;
-  --danger: #ff5c7a;
-  --warning: #f0b84d;
-  --ok: #39d98a;
-  --shadow: 0 20px 50px rgba(0, 0, 0, 0.28);
+  --bg: #0b0f19;
+  --surface: #111827;
+  --surface-raised: #1e293b;
+  --surface-hover: #334155;
+  --border: #1e293b;
+  --border-active: #3b82f6;
+  --text: #f8fafc;
+  --text-muted: #94a3b8;
+  --text-dim: #64748b;
+  --accent: #3b82f6;
+  --accent-hover: #2563eb;
+  --accent-light: rgba(59, 130, 246, 0.12);
+  --danger: #ef4444;
+  --danger-bg: rgba(239, 68, 68, 0.12);
+  --warning: #f59e0b;
+  --warning-bg: rgba(245, 158, 11, 0.12);
+  --success: #10b981;
+  --success-bg: rgba(16, 185, 129, 0.12);
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 10px 25px -5px rgba(0, 0, 0, 0.3), 0 8px 10px -6px rgba(0, 0, 0, 0.3);
 }
 * { box-sizing: border-box; }
-html, body { min-height: 100%; }
+html, body { min-height: 100%; margin: 0; }
 body {
-  margin: 0;
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  background-color: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3, p { margin: 0; }
+h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.025em; }
+h2 { font-size: 16px; font-weight: 600; letter-spacing: -0.015em; }
+h3 { font-size: 14px; font-weight: 600; color: var(--text); }
+p { color: var(--text-muted); font-size: 13px; text-wrap: pretty; }
+button, input, textarea { font: inherit; }
+
+.mono-stat {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.mono-input {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
   background: var(--bg);
-  color: var(--text);
+  color: var(--text-muted);
 }
-button, input, textarea {
-  font: inherit;
-}
-button {
-  border: 0;
-}
-code {
-  color: var(--accent);
-}
-.auth-screen {
-  display: grid;
-  place-items: center;
-  min-height: 100vh;
-  padding: 24px;
-  background:
-    linear-gradient(180deg, rgba(32, 208, 168, 0.08), transparent 40%),
-    var(--bg);
-}
-.auth-panel {
-  width: min(440px, 100%);
-  padding: 32px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: var(--shadow);
-}
-.brand-mark {
-  display: grid;
-  place-items: center;
-  width: 48px;
-  height: 48px;
-  margin-bottom: 20px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: #07100d;
-  font-weight: 800;
-}
-h1, h2, p {
-  margin-top: 0;
-}
-h1 {
-  margin-bottom: 8px;
-  font-size: clamp(26px, 5vw, 36px);
-  letter-spacing: 0;
-}
-h2 {
-  margin-bottom: 8px;
-  font-size: 16px;
-  letter-spacing: 0;
-}
-p {
-  color: var(--muted);
-  line-height: 1.6;
-}
-label {
-  color: var(--muted);
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  font-weight: 500;
   font-size: 13px;
-  font-weight: 600;
-}
-input, textarea {
-  width: 100%;
-  color: var(--text);
-  background: #090d14;
-  border: 1px solid var(--border);
-  border-radius: 6px;
+  padding: 8px 14px;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all 140ms ease-in-out;
   outline: none;
 }
-input {
-  min-height: 42px;
-  padding: 10px 12px;
+.btn:focus-visible {
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
 }
-textarea {
-  min-height: 58vh;
-  padding: 16px;
-  resize: vertical;
-  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
-  font-size: 13px;
-  line-height: 1.55;
-  white-space: pre;
+.btn:active:not(:disabled) {
+  transform: scale(0.98);
 }
-input:focus, textarea:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(32, 208, 168, 0.12);
-}
-.primary-button, .ghost-button, .danger-button {
-  min-height: 38px;
-  padding: 9px 14px;
-  border-radius: 6px;
-  color: var(--text);
-  cursor: pointer;
-  transition: background 160ms ease, border-color 160ms ease, transform 160ms ease;
-}
-.primary-button {
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  color: #06100d;
-  font-weight: 800;
-}
-.ghost-button {
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-}
-.danger-button {
-  background: rgba(255, 92, 122, 0.12);
-  border: 1px solid rgba(255, 92, 122, 0.5);
-  color: #ffd4dd;
-}
-button:hover:not(:disabled) {
-  transform: translateY(-1px);
-}
-button:disabled {
-  cursor: not-allowed;
+.btn:disabled {
   opacity: 0.5;
+  cursor: not-allowed;
 }
-.stack {
-  display: grid;
-  gap: 12px;
+.btn-sm {
+  padding: 6px 10px;
+  font-size: 12px;
 }
-.compact {
-  gap: 8px;
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
 }
-.notice {
-  margin: 16px 0;
-  padding: 12px;
-  border-radius: 6px;
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+.btn-secondary {
+  background: var(--surface-raised);
+  border-color: var(--border);
+  color: var(--text);
+}
+.btn-secondary:hover:not(:disabled) {
+  background: var(--surface-hover);
+  border-color: var(--border-active);
+}
+.btn-ghost {
+  background: transparent;
+  color: var(--text-muted);
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--surface-raised);
+  color: var(--text);
+}
+.btn-danger {
+  background: var(--danger-bg);
+  border-color: rgba(239, 68, 68, 0.3);
+  color: #fca5a5;
+}
+.btn-danger:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.25);
+  border-color: var(--danger);
+}
+
+.form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.form-stack.compact {
+  gap: 10px;
+}
+.field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+input[type="text"], input[type="password"] {
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  outline: none;
   font-size: 13px;
-  line-height: 1.5;
+  transition: border-color 140ms ease;
 }
-.notice.error {
-  background: rgba(255, 92, 122, 0.12);
-  border: 1px solid rgba(255, 92, 122, 0.45);
+input[type="text"]:focus, input[type="password"]:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-light);
 }
-.notice.warning {
-  background: rgba(240, 184, 77, 0.12);
-  border: 1px solid rgba(240, 184, 77, 0.45);
-}`;
+.field-hint {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.alert {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.alert-error {
+  background: var(--danger-bg);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  color: #fca5a5;
+}
+.alert-warning {
+  background: var(--warning-bg);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  color: #fcd34d;
+}
+
+.auth-screen {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: radial-gradient(circle at top center, rgba(59, 130, 246, 0.08) 0%, transparent 60%), var(--bg);
+}
+.auth-card {
+  width: 100%;
+  max-width: 400px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 28px;
+  box-shadow: var(--shadow-md);
+}
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.brand-badge {
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-sm);
+  background: var(--accent-light);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+}
+.brand-badge.danger {
+  background: var(--danger-bg);
+  color: var(--danger);
+}
+.brand-title {
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+.version-tag {
+  font-size: 10px;
+  background: var(--surface-raised);
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--text-dim);
+  margin-left: auto;
+}
+.subtitle {
+  margin: 6px 0 20px;
+  font-size: 13px;
+  line-height: 1.45;
+}
+`;
 }
 
 function dashboardStyles() {
   return `
-.dashboard-screen {
+.dashboard-body {
   min-height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
-.topbar {
+.app-header {
   position: sticky;
   top: 0;
-  z-index: 10;
+  z-index: 20;
+  background: rgba(11, 15, 25, 0.88);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.header-content {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 12px 20px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
-  padding: 16px 24px;
-  background: rgba(9, 11, 15, 0.92);
-  border-bottom: 1px solid var(--border);
-  backdrop-filter: blur(16px);
 }
-.topbar h1 {
-  margin: 0;
-  font-size: 22px;
-}
-.eyebrow {
-  margin-bottom: 3px;
-  color: var(--accent);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0;
-  text-transform: uppercase;
-}
-.topbar-actions, .toolbar, .editor-actions, .copy-row {
+.header-brand {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
-.state-pill {
-  display: inline-flex;
+.brand-text {
+  display: flex;
+  flex-direction: column;
+}
+.brand-sub {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.header-actions {
+  display: flex;
   align-items: center;
-  min-height: 30px;
-  padding: 6px 10px;
-  border-radius: 999px;
-  font-size: 12px;
-  border: 1px solid var(--border);
-  color: var(--muted);
+  gap: 12px;
 }
-.state-pill.dirty {
-  color: #171103;
-  background: var(--warning);
-  border-color: var(--warning);
+
+.status-pill {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 9px;
+  border-radius: 9999px;
+  border: 1px solid transparent;
 }
-.state-pill.clean {
-  color: #04140d;
-  background: var(--ok);
-  border-color: var(--ok);
+.status-saved {
+  background: var(--success-bg);
+  color: var(--success);
+  border-color: rgba(16, 185, 129, 0.3);
 }
-.state-pill.error {
-  color: #fff;
-  background: var(--danger);
-  border-color: var(--danger);
+.status-dirty {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border-color: rgba(245, 158, 11, 0.3);
 }
-.workspace {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
-  gap: 18px;
-  width: min(1500px, 100%);
+.status-error {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.3);
+}
+
+.app-layout {
+  max-width: 1400px;
+  width: 100%;
   margin: 0 auto;
-  padding: 18px;
+  padding: 20px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 20px;
+  flex: 1;
 }
-.editor-panel, .stat-block {
+
+.card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: var(--shadow);
-}
-.editor-panel {
-  min-width: 0;
-  overflow: hidden;
-}
-.panel-header {
-  display: flex;
-  justify-content: space-between;
-  gap: 16px;
-  padding: 18px;
-  border-bottom: 1px solid var(--border);
-}
-.panel-header p {
-  margin-bottom: 0;
-  font-size: 13px;
-}
-#links-form {
-  padding: 18px;
-}
-.editor-actions {
-  justify-content: flex-end;
-  margin-top: 12px;
-}
-.status-rail {
-  display: grid;
-  align-content: start;
-  gap: 14px;
-}
-.stat-block {
+  border-radius: var(--radius-md);
   padding: 16px;
-}
-.metric-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-.metric-grid div {
-  padding: 12px;
-  background: #0c1119;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-}
-.metric-grid span {
-  display: block;
-  margin-bottom: 6px;
-  color: var(--muted);
-  font-size: 11px;
-  text-transform: uppercase;
-}
-.metric-grid strong {
-  font-size: 18px;
-}
-.copy-row input {
-  min-width: 0;
-  font-size: 12px;
-}
-.fine-print {
-  margin: 10px 0 0;
-  font-size: 12px;
-}
-.protocol-list, .validation-list {
-  display: grid;
-  gap: 8px;
-}
-.protocol-row, .validation-item {
   display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.editor-card {
+  height: 100%;
+  min-height: 600px;
+}
+.card-header {
+  display: flex;
+  align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 9px 10px;
-  background: #0c1119;
+}
+.card-header-simple {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 4px;
+}
+.section-desc {
+  font-size: 12px;
+  margin-top: 2px;
+}
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#editor-form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+.textarea-wrapper {
+  flex: 1;
+  display: flex;
+  position: relative;
+}
+textarea {
+  width: 100%;
+  min-height: 480px;
+  height: 100%;
+  background: #080c14;
   border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--muted);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 14px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
   font-size: 13px;
+  line-height: 1.6;
+  resize: vertical;
+  outline: none;
 }
-.validation-item {
-  display: block;
-  line-height: 1.45;
+textarea:focus {
+  border-color: var(--border-active);
+  box-shadow: 0 0 0 3px var(--accent-light);
 }
-.validation-item.warning {
-  border-color: rgba(240, 184, 77, 0.45);
-  color: #ffe2a8;
+
+.editor-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 12px;
 }
-.validation-item.error {
-  border-color: rgba(255, 92, 122, 0.55);
-  color: #ffd4dd;
+.editor-footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
-#notifications {
-  position: fixed;
-  top: 78px;
-  right: 18px;
-  z-index: 20;
+
+.stat-grid {
   display: grid;
-  gap: 10px;
-  width: min(360px, calc(100vw - 36px));
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.stat-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+}
+.stat-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.stat-val {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  margin-top: 2px;
+}
+.stat-val-sm {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.url-block label {
+  display: block;
+  margin-bottom: 4px;
+}
+.input-action-row {
+  display: flex;
+  gap: 6px;
+}
+
+.pill-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.proto-tag {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.proto-tag strong {
+  color: var(--accent);
+}
+
+.diagnostic-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.diag-item {
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--bg);
+  border-left: 3px solid var(--border);
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+.diag-item.warning {
+  border-left-color: var(--warning);
+  color: #fcd34d;
+}
+.diag-item.error {
+  border-left-color: var(--danger);
+  color: #fca5a5;
+}
+
+.sec-status-text {
+  font-size: 12px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+#toast-shelf {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 .toast {
-  padding: 12px 14px;
-  background: var(--surface-2);
+  background: var(--surface-raised);
   border: 1px solid var(--border);
-  border-left: 3px solid var(--accent);
-  border-radius: 6px;
-  box-shadow: var(--shadow);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
   color: var(--text);
   font-size: 13px;
+  box-shadow: var(--shadow-md);
+  animation: toast-in 160ms ease-out;
 }
-.toast.error {
-  border-left-color: var(--danger);
+.toast.toast-error {
+  border-color: var(--danger);
+  color: #fca5a5;
 }
-@media (max-width: 980px) {
-  .workspace {
+@keyframes toast-in {
+  from { transform: translateY(8px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@media (max-width: 960px) {
+  .app-layout {
     grid-template-columns: 1fr;
   }
-  textarea {
-    min-height: 46vh;
+  .editor-card {
+    min-height: 440px;
   }
 }
-@media (max-width: 680px) {
-  .topbar, .panel-header, .toolbar, .editor-actions {
-    align-items: stretch;
-    flex-direction: column;
-  }
-  .topbar-actions {
-    width: 100%;
-    justify-content: space-between;
-  }
-  .workspace {
-    padding: 10px;
-  }
-  .metric-grid {
-    grid-template-columns: 1fr;
-  }
-}`;
+`;
 }
 
 function dashboardScript() {
@@ -1324,18 +1698,21 @@ function dashboardScript() {
 (function () {
   "use strict";
 
-  const state = JSON.parse(document.getElementById("sublink-state").textContent);
+  const state = JSON.parse(document.getElementById("sublink-data").textContent);
   const csrfToken = state.csrfToken;
-  const linksBox = document.getElementById("links-box");
-  const linksForm = document.getElementById("links-form");
-  const saveState = document.getElementById("save-state");
-  const saveButton = document.getElementById("save-button");
-  const fileInput = document.getElementById("file-input");
-  let lastSavedValue = linksBox.value;
-  let latestValidation = state.validation;
+  const editor = document.getElementById("links-editor");
+  const form = document.getElementById("editor-form");
+  const saveStatus = document.getElementById("save-status-pill");
+  const saveBtn = document.getElementById("btn-save");
+  const restoreBtn = document.getElementById("btn-restore");
+  const fileInput = document.getElementById("hidden-file-input");
+  const charCounter = document.getElementById("char-counter");
 
-  function byteLength(value) {
-    return new TextEncoder().encode(value).length;
+  let lastCleanValue = editor.value;
+
+  function countLines(str) {
+    if (!str.trim()) return 0;
+    return str.split(/\\r?\\n/).filter(function (l) { return l.trim().length > 0; }).length;
   }
 
   function formatBytes(bytes) {
@@ -1344,299 +1721,268 @@ function dashboardScript() {
     return (bytes / 1024 / 1024).toFixed(2) + " MiB";
   }
 
-  function protocolFromLine(line) {
-    const match = /^([a-z][a-z0-9+.-]*):\\/\\//i.exec(line);
-    return match ? match[1].toLowerCase() : "";
+  function toast(msg, isError) {
+    const shelf = document.getElementById("toast-shelf");
+    const item = document.createElement("div");
+    item.className = "toast" + (isError ? " toast-error" : "");
+    item.textContent = msg;
+    shelf.appendChild(item);
+    setTimeout(function () {
+      item.style.opacity = "0";
+      setTimeout(function () { item.remove(); }, 200);
+    }, 4000);
   }
 
-  function analyzeContent(content) {
+  function setStatus(mode, label) {
+    saveStatus.className = "status-pill status-" + mode;
+    saveStatus.textContent = label;
+  }
+
+  function renderStats(val, meta) {
+    document.getElementById("stat-nodes").textContent = val.configCount;
+    document.getElementById("stat-size").textContent = formatBytes(val.byteSize);
+    document.getElementById("stat-issues").textContent = val.warnings.length + (val.errors || []).length;
+    if (meta && meta.updatedAt) {
+      const dt = new Date(meta.updatedAt);
+      document.getElementById("stat-saved").textContent = dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' });
+    }
+    charCounter.textContent = countLines(editor.value) + " lines";
+
+    // Protocol list
+    const protoContainer = document.getElementById("protocol-container");
+    protoContainer.innerHTML = "";
+    const entries = Object.entries(val.protocolCounts || {});
+    if (!entries.length) {
+      protoContainer.innerHTML = '<span style="font-size:12px;color:var(--text-dim)">No active protocols</span>';
+    } else {
+      entries.sort().forEach(function (e) {
+        const span = document.createElement("span");
+        span.className = "proto-tag";
+        span.innerHTML = e[0] + ": <strong>" + e[1] + "</strong>";
+        protoContainer.appendChild(span);
+      });
+    }
+
+    // Diagnostics
+    const diagContainer = document.getElementById("diagnostics-container");
+    diagContainer.innerHTML = "";
+    const issues = []
+      .concat((val.errors || []).map(function (m) { return { type: "error", msg: m }; }))
+      .concat((val.warnings || []).map(function (m) { return { type: "warning", msg: m }; }));
+
+    if (!issues.length) {
+      diagContainer.innerHTML = '<div class="diag-item">Configs well-formed. No syntax issues.</div>';
+    } else {
+      issues.forEach(function (i) {
+        const item = document.createElement("div");
+        item.className = "diag-item " + i.type;
+        item.textContent = i.msg;
+        diagContainer.appendChild(item);
+      });
+    }
+  }
+
+  function analyzeClientSide(text) {
+    const lines = text.split(/\\r?\\n/);
     const supported = ${JSON.stringify(SUPPORTED_PROTOCOLS)};
-    const lines = content.split(/\\r?\\n/);
     const protocolCounts = {};
     const warnings = [];
-    const errors = [];
-    const seen = new Set();
     let configCount = 0;
-    const trimmed = content.trim();
-    const bytes = byteLength(content);
+    const seen = new Set();
 
-    if (bytes > ${MAX_LINKS_BYTES}) {
-      errors.push("Content exceeds the 24 MiB save limit.");
-    }
-    if (!trimmed) {
-      warnings.push("Subscription is empty.");
-      return { byteSize: bytes, isEmpty: true, configCount, protocolCounts, warnings, errors };
+    if (!text.trim()) {
+      return { byteSize: 0, isEmpty: true, configCount: 0, protocolCounts: {}, warnings: ["Editor empty."] };
     }
 
-    if ((trimmed.startsWith("{") || trimmed.startsWith("["))) {
-      try {
-        const parsed = JSON.parse(trimmed);
-        const count = Array.isArray(parsed) ? parsed.length : 1;
-        configCount += count;
-        protocolCounts.json = count;
-        return { byteSize: bytes, isEmpty: false, configCount, protocolCounts, warnings, errors };
-      } catch (_error) {
-        warnings.push("Top-level JSON could not be parsed; line checks will continue.");
-      }
-    }
-
-    lines.forEach(function (line, index) {
-      const value = line.trim();
-      if (!value) return;
-      if (seen.has(value)) warnings.push("Duplicate entry detected on line " + (index + 1) + ".");
-      seen.add(value);
-      const protocol = protocolFromLine(value);
-      if (protocol && supported.includes(protocol)) {
-        configCount += 1;
-        protocolCounts[protocol] = (protocolCounts[protocol] || 0) + 1;
-      } else if (protocol) {
-        warnings.push("Unsupported protocol on line " + (index + 1) + ": " + protocol);
-      } else if (value.startsWith("{") || value.startsWith("[")) {
-        warnings.push("JSON block detected on line " + (index + 1) + "; server will validate the full block on save.");
+    lines.forEach(function (l, idx) {
+      const line = l.trim();
+      if (!line) return;
+      if (seen.has(line)) warnings.push("Duplicate on line " + (idx + 1));
+      seen.add(line);
+      const match = /^([a-z][a-z0-9+.-]*):\\/\\//i.exec(line);
+      if (match) {
+        const p = match[1].toLowerCase();
+        if (supported.includes(p)) {
+          configCount += 1;
+          protocolCounts[p] = (protocolCounts[p] || 0) + 1;
+        } else {
+          warnings.push("Unsupported protocol: " + p);
+        }
+      } else if (line.startsWith("{") || line.startsWith("[")) {
         configCount += 1;
         protocolCounts.json = (protocolCounts.json || 0) + 1;
-      } else {
-        warnings.push("Unknown content on line " + (index + 1) + ".");
       }
     });
 
-    return { byteSize: bytes, isEmpty: false, configCount, protocolCounts, warnings: warnings.slice(0, 50), errors };
+    return {
+      byteSize: new TextEncoder().encode(text).length,
+      isEmpty: false,
+      configCount: configCount,
+      protocolCounts: protocolCounts,
+      warnings: warnings.slice(0, 30),
+      errors: []
+    };
   }
 
-  function setSaveState(mode, label) {
-    saveState.className = "state-pill " + mode;
-    saveState.textContent = label;
-  }
-
-  function renderStats(validation, meta) {
-    latestValidation = validation;
-    document.getElementById("config-count").textContent = validation.configCount;
-    document.getElementById("byte-size").textContent = formatBytes(validation.byteSize);
-    document.getElementById("warning-count").textContent = validation.warnings.length + validation.errors.length;
-    if (meta && meta.updatedAt) {
-      document.getElementById("updated-at").textContent = new Date(meta.updatedAt).toLocaleString();
-    }
-
-    const protocolList = document.getElementById("protocol-list");
-    const protocols = Object.entries(validation.protocolCounts || {});
-    protocolList.textContent = "";
-    if (!protocols.length) {
-      const item = document.createElement("div");
-      item.className = "protocol-row";
-      item.textContent = "No protocols detected";
-      protocolList.appendChild(item);
+  editor.addEventListener("input", function () {
+    const val = analyzeClientSide(editor.value);
+    renderStats(val, null);
+    if (editor.value === lastCleanValue) {
+      setStatus("saved", "Synced");
     } else {
-      protocols.sort().forEach(function (entry) {
-        const row = document.createElement("div");
-        row.className = "protocol-row";
-        const name = document.createElement("span");
-        const count = document.createElement("strong");
-        name.textContent = entry[0];
-        count.textContent = entry[1];
-        row.append(name, count);
-        protocolList.appendChild(row);
-      });
-    }
-
-    const validationList = document.getElementById("validation-list");
-    validationList.textContent = "";
-    const messages = []
-      .concat((validation.errors || []).map(function (message) { return { type: "error", message }; }))
-      .concat((validation.warnings || []).map(function (message) { return { type: "warning", message }; }));
-    if (!messages.length) {
-      const item = document.createElement("div");
-      item.className = "validation-item";
-      item.textContent = "No validation issues detected.";
-      validationList.appendChild(item);
-    } else {
-      messages.forEach(function (entry) {
-        const item = document.createElement("div");
-        item.className = "validation-item " + entry.type;
-        item.textContent = entry.message;
-        validationList.appendChild(item);
-      });
-    }
-  }
-
-  function toast(message, type) {
-    const node = document.createElement("div");
-    node.className = "toast " + (type || "");
-    node.textContent = message;
-    document.getElementById("notifications").appendChild(node);
-    setTimeout(function () { node.remove(); }, 5000);
-  }
-
-  async function postForm(url, form) {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "x-csrf-token": csrfToken },
-      body: form,
-    });
-    const body = await response.json().catch(function () {
-      return { ok: false, error: "Unexpected response." };
-    });
-    if (!response.ok || !body.ok) {
-      throw new Error(body.error || "Request failed.");
-    }
-    return body;
-  }
-
-  async function postJson(url, data) {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-csrf-token": csrfToken,
-      },
-      body: JSON.stringify(data),
-    });
-    const body = await response.json().catch(function () {
-      return { ok: false, error: "Unexpected response." };
-    });
-    if (!response.ok || !body.ok) {
-      throw new Error(body.error || "Request failed.");
-    }
-    return body;
-  }
-
-  linksBox.addEventListener("input", function () {
-    const validation = analyzeContent(linksBox.value);
-    renderStats(validation, null);
-    if (linksBox.value === lastSavedValue) {
-      setSaveState("clean", "Saved");
-    } else {
-      setSaveState("dirty", "Unsaved");
+      setStatus("dirty", "Unsaved");
     }
   });
 
-  linksForm.addEventListener("submit", async function (event) {
-    event.preventDefault();
-    const validation = analyzeContent(linksBox.value);
-    if (validation.isEmpty && !confirm("Save an empty public subscription?")) {
-      return;
-    }
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const text = editor.value;
+    const val = analyzeClientSide(text);
+    if (val.isEmpty && !confirm("Save empty subscription output?")) return;
 
-    const payload = {
-      csrf_token: csrfToken,
-      links: linksBox.value,
-      confirm_empty: validation.isEmpty ? "true" : "false",
-    };
-    saveButton.disabled = true;
-    setSaveState("dirty", "Saving");
+    saveBtn.disabled = true;
+    setStatus("dirty", "Saving...");
 
     try {
-      const body = await postJson("/update-links", payload);
-      lastSavedValue = linksBox.value;
-      renderStats(body.validation, body.meta);
-      setSaveState("clean", "Saved");
-      document.getElementById("restore-button").disabled = false;
-      toast("Subscription saved. Edge caches may take a little time to converge.");
-    } catch (error) {
-      setSaveState("error", "Error");
-      toast(error.message, "error");
+      const res = await fetch("/update-links", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-csrf-token": csrfToken,
+        },
+        body: JSON.stringify({
+          links: text,
+          confirm_empty: val.isEmpty ? "true" : "false",
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || "Save failed");
+
+      lastCleanValue = text;
+      renderStats(data.validation, data.meta);
+      setStatus("saved", "Synced");
+      restoreBtn.disabled = false;
+      toast("Subscription updated successfully.");
+    } catch (err) {
+      setStatus("error", "Error");
+      toast(err.message, true);
     } finally {
-      saveButton.disabled = false;
+      saveBtn.disabled = false;
     }
   });
 
-  document.getElementById("validate-button").addEventListener("click", function () {
-    renderStats(analyzeContent(linksBox.value), null);
-    toast("Validation refreshed.");
-  });
-
-  document.getElementById("clear-button").addEventListener("click", function () {
-    if (confirm("Clear the editor? Save is still required afterward.")) {
-      linksBox.value = "";
-      linksBox.dispatchEvent(new Event("input"));
+  document.getElementById("btn-clear").addEventListener("click", function () {
+    if (confirm("Clear editor contents?")) {
+      editor.value = "";
+      editor.dispatchEvent(new Event("input"));
     }
   });
 
-  document.getElementById("import-button").addEventListener("click", function () {
+  document.getElementById("btn-import").addEventListener("click", function () {
     fileInput.click();
   });
 
   fileInput.addEventListener("change", function () {
-    const file = fileInput.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = function () {
-      linksBox.value = String(reader.result || "");
-      linksBox.dispatchEvent(new Event("input"));
-      toast("Imported " + file.name + ".");
+    const f = fileInput.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = function () {
+      editor.value = String(r.result || "");
+      editor.dispatchEvent(new Event("input"));
+      toast("Imported " + f.name);
       fileInput.value = "";
     };
-    reader.readAsText(file);
+    r.readAsText(f);
   });
 
-  document.getElementById("export-button").addEventListener("click", function () {
-    const blob = new Blob([linksBox.value], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = "sublink-config.txt";
-    anchor.click();
-    URL.revokeObjectURL(url);
-    toast("Export started.");
+  document.getElementById("btn-export").addEventListener("click", function () {
+    const b = new Blob([editor.value], { type: "text/plain;charset=utf-8" });
+    const u = URL.createObjectURL(b);
+    const a = document.createElement("a");
+    a.href = u;
+    a.download = "sublink-nodes.txt";
+    a.click();
+    URL.revokeObjectURL(u);
   });
 
-  document.getElementById("restore-button").addEventListener("click", async function () {
-    if (!confirm("Restore the previous saved subscription? Current content becomes the new backup.")) return;
-    const form = new FormData();
-    form.set("csrf_token", csrfToken);
+  restoreBtn.addEventListener("click", async function () {
+    if (!confirm("Rollback to the previously saved node list?")) return;
+    const fd = new FormData();
+    fd.set("csrf_token", csrfToken);
     try {
-      const body = await postForm("/restore-backup", form);
-      linksBox.value = body.links;
-      lastSavedValue = body.links;
-      renderStats(body.validation, body.meta);
-      setSaveState("clean", "Saved");
-      toast("Backup restored.");
-    } catch (error) {
-      toast(error.message, "error");
+      const res = await fetch("/restore-backup", {
+        method: "POST",
+        headers: { "x-csrf-token": csrfToken },
+        body: fd,
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || "Rollback failed");
+      editor.value = data.links;
+      lastCleanValue = data.links;
+      renderStats(data.validation, data.meta);
+      setStatus("saved", "Synced");
+      toast("Restored previous backup.");
+    } catch (err) {
+      toast(err.message, true);
     }
   });
 
-  document.getElementById("copy-button").addEventListener("click", async function () {
-    const input = document.getElementById("subscription-url");
-    try {
-      await navigator.clipboard.writeText(input.value);
-    } catch (_error) {
-      input.select();
-      document.execCommand("copy");
-    }
-    toast("Public subscription URL copied.");
+  document.querySelectorAll(".copy-btn").forEach(function (btn) {
+    btn.addEventListener("click", async function () {
+      const targetId = btn.getAttribute("data-target");
+      const inp = document.getElementById(targetId);
+      if (!inp) return;
+      try {
+        await navigator.clipboard.writeText(inp.value);
+      } catch (_e) {
+        inp.select();
+        document.execCommand("copy");
+      }
+      toast("URL copied to clipboard.");
+    });
   });
 
-  document.getElementById("logout-button").addEventListener("click", async function () {
-    const form = new FormData();
-    form.set("csrf_token", csrfToken);
+  document.getElementById("logout-btn").addEventListener("click", async function () {
+    const fd = new FormData();
+    fd.set("csrf_token", csrfToken);
+    await fetch("/admin/logout", {
+      method: "POST",
+      headers: { "x-csrf-token": csrfToken },
+      body: fd,
+    });
+    window.location.href = "/admin";
+  });
+
+  document.getElementById("change-pw-form").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    const fd = new FormData(e.currentTarget);
     try {
-      await postForm("/admin/logout", form);
-      window.location.href = "/admin";
-    } catch (error) {
-      toast(error.message, "error");
+      const res = await fetch("/admin/password", {
+        method: "POST",
+        headers: { "x-csrf-token": csrfToken },
+        body: fd,
+      });
+      const data = await res.json();
+      if (!res.ok || !data.ok) throw new Error(data.error || "Failed to update password");
+      e.currentTarget.reset();
+      toast("Password updated.");
+    } catch (err) {
+      toast(err.message, true);
     }
   });
 
-  document.getElementById("password-form").addEventListener("submit", async function (event) {
-    event.preventDefault();
-    const form = new FormData(event.currentTarget);
-    try {
-      await postForm("/admin/password", form);
-      event.currentTarget.reset();
-      toast("Password changed.");
-    } catch (error) {
-      toast(error.message, "error");
-    }
-  });
+  document.getElementById("sec-notice").textContent = state.hasAuthSecret
+    ? "AUTH_SECRET is active. Key derivation combines client secret + salt."
+    : "AUTH_SECRET is not configured. PBKDF2 salt is active.";
 
-  document.getElementById("auth-secret-state").textContent = state.hasAuthSecret
-    ? "AUTH_SECRET is configured for HMAC password protection."
-    : "AUTH_SECRET is not configured; salted SHA-256 fallback is active.";
-
-  renderStats(latestValidation, state.meta);
+  renderStats(state.validation, state.meta);
 })();
 `;
 }
+
+// ---------------------------------------------------------------------------
+// Response & Header Generators
+// ---------------------------------------------------------------------------
 
 function htmlResponse(html, { nonce, status = 200, headers = {} } = {}) {
   const responseHeaders = secureHtmlHeaders(nonce);
@@ -1769,6 +2115,16 @@ function base64UrlEncodeBytes(bytes) {
   return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
 
+function base64EncodeUtf8(value) {
+  const bytes = encodeText(value);
+  if (typeof Buffer !== "undefined") {
+    return Buffer.from(bytes).toString("base64");
+  }
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 async function sha256Hex(value) {
   const digest = await crypto.subtle.digest("SHA-256", encodeText(value));
   return [...new Uint8Array(digest)]
@@ -1779,7 +2135,7 @@ async function sha256Hex(value) {
 function constantTimeEqual(left, right) {
   const a = String(left);
   const b = String(right);
-  let mismatch = a.length ^ b.length;
+  let mismatch = a.length === b.length ? 0 : 1;
   const length = Math.max(a.length, b.length);
 
   for (let i = 0; i < length; i += 1) {
@@ -1791,14 +2147,13 @@ function constantTimeEqual(left, right) {
   return mismatch === 0;
 }
 
-if (typeof addEventListener !== "function") {
-  globalThis.__SUBLINK_WORKER_TESTS__ = {
-    handleRequest,
-    validateSubscriptionContent,
-    createPasswordRecord,
-    verifyPasswordEntry,
-    loadPasswordEntry,
-    escapeHtml,
-    SESSION_COOKIE,
-  };
-}
+export const __SUBLINK_WORKER_TESTS__ = {
+  handleRequest,
+  validateSubscriptionContent,
+  createPasswordRecord,
+  verifyPasswordEntry,
+  loadPasswordEntry,
+  constantTimeEqual,
+  escapeHtml,
+  SESSION_COOKIE,
+};
