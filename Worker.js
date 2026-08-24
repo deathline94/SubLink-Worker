@@ -25,6 +25,9 @@ const SUPPORTED_PROTOCOLS = [
   "https",
 ];
 
+// Clients whose subscriptions are conventionally base64-encoded link lists.
+// Clash/Stash are deliberately excluded: they require YAML, which this worker
+// does not generate, so serving them base64 would only produce garbage.
 const KNOWN_B64_CLIENT_AGENTS = [
   "v2rayn",
   "v2rayng",
@@ -37,12 +40,12 @@ const KNOWN_B64_CLIENT_AGENTS = [
   "sagernet",
   "nekobox",
   "sing-box",
-  "clash",
-  "stash",
   "hiddify",
 ];
 
-// Dual runtime support: Service Worker listener + ES Module export
+// Dual runtime support. The Service Worker listener below only fires on legacy
+// SW-format deployments; ES Module workers exclusively use the default export,
+// where this listener is inert. Keeping both lets the same file deploy either way.
 if (typeof addEventListener === "function") {
   addEventListener("fetch", (event) => {
     event.respondWith(handleRequest(event.request, getDefaultEnv()));
@@ -60,22 +63,39 @@ async function handleRequest(request, env = getDefaultEnv()) {
   const path = normalizePath(url.pathname);
 
   try {
+    const isReadMethod = request.method === "GET" || request.method === "HEAD";
+    const notFound = () =>
+      textResponse("Not found", {
+        status: 404,
+        headers: { "cache-control": "no-store" },
+      });
+
     if (path === "/favicon.ico") {
-      return request.method === "GET"
+      return isReadMethod
         ? new Response(null, { status: 204 })
-        : methodNotAllowed(["GET"]);
+        : methodNotAllowed(["GET", "HEAD"]);
     }
 
     if (path === "/" || path === "/sub") {
-      return request.method === "GET"
-        ? generateSubscription(request, env)
-        : methodNotAllowed(["GET"]);
+      if (!isReadMethod) return methodNotAllowed(["GET", "HEAD"]);
+      // With SUB_TOKEN configured the public root stops serving the feed;
+      // the subscription moves to /sub/<token> only.
+      if (hasSubToken(env)) return notFound();
+      return generateSubscription(request, env);
+    }
+
+    if (path.startsWith("/sub/")) {
+      if (!isReadMethod) return methodNotAllowed(["GET", "HEAD"]);
+      if (!hasSubToken(env)) return notFound();
+      const token = decodeURIComponentSafe(path.slice("/sub/".length));
+      if (!token || !constantTimeEqual(token, env.SUB_TOKEN.trim())) return notFound();
+      return generateSubscription(request, env);
     }
 
     if (path === "/admin") {
-      return request.method === "GET"
+      return isReadMethod
         ? handleAdminPage(request, env)
-        : methodNotAllowed(["GET"]);
+        : methodNotAllowed(["GET", "HEAD"]);
     }
 
     if (path === "/admin/setup") {
@@ -114,10 +134,7 @@ async function handleRequest(request, env = getDefaultEnv()) {
         : methodNotAllowed(["POST"]);
     }
 
-    return textResponse("Not found", {
-      status: 404,
-      headers: { "cache-control": "no-store" },
-    });
+    return notFound();
   } catch (error) {
     console.error(error);
     return textResponse("Internal server error", {
@@ -131,14 +148,16 @@ function getDefaultEnv() {
   return {
     sub: typeof sub !== "undefined" ? sub : null,
     AUTH_SECRET: typeof AUTH_SECRET !== "undefined" ? String(AUTH_SECRET || "") : "",
+    SUB_TOKEN: typeof SUB_TOKEN !== "undefined" && SUB_TOKEN ? String(SUB_TOKEN) : "",
   };
 }
 
 function normalizePath(pathname) {
-  if (pathname.length > 1 && pathname.endsWith("/")) {
-    return pathname.slice(0, -1);
+  let path = pathname || "/";
+  while (path.length > 1 && path.endsWith("/")) {
+    path = path.slice(0, -1);
   }
-  return pathname || "/";
+  return path;
 }
 
 function getKV(env) {
@@ -149,6 +168,12 @@ function getKV(env) {
 
 function hasAuthSecret(env) {
   return !!(env && typeof env.AUTH_SECRET === "string" && env.AUTH_SECRET.trim());
+}
+
+function hasSubToken(env) {
+  // Opt-in private feed. A token shorter than 16 chars is ignored so weak
+  // values cannot silently weaken the default public behavior.
+  return !!(env && typeof env.SUB_TOKEN === "string" && env.SUB_TOKEN.trim().length >= 16);
 }
 
 function authSecretWarning(env) {
@@ -206,9 +231,35 @@ async function handleAdminPage(request, env) {
   const links = await kvGet(kv, "vpn_links", "");
   const backup = await kvGet(kv, "vpn_links_backup", null);
   const storedMeta = await kvGetJson(kv, "vpn_meta", null);
-  const validation = validateSubscriptionContent(links);
+
+  // Prefer fingerprint-verified cached metadata over a full re-parse so large
+  // subscriptions do not burn CPU limits on every dashboard load.
+  const fingerprint = await sha256Hex(links);
+  let validation;
+  if (
+    storedMeta &&
+    storedMeta.fingerprint === fingerprint &&
+    Array.isArray(storedMeta.warnings) &&
+    Array.isArray(storedMeta.errors)
+  ) {
+    validation = {
+      byteSize: typeof storedMeta.byteSize === "number" ? storedMeta.byteSize : byteLength(links),
+      maxBytes: MAX_LINKS_BYTES,
+      isEmpty: links.trim().length === 0,
+      configCount: Number(storedMeta.configCount || 0),
+      protocolCounts: storedMeta.protocolCounts || {},
+      warnings: storedMeta.warnings,
+      errors: storedMeta.errors,
+    };
+  } else {
+    validation = validateSubscriptionContent(links);
+  }
+
   const meta = storedMeta || (await buildMetadata(links, validation));
   const url = new URL(request.url);
+  const subBase = hasSubToken(env)
+    ? `${url.origin}/sub/${encodeURIComponent(env.SUB_TOKEN.trim())}`
+    : `${url.origin}/`;
 
   return htmlResponse(
     generateDashboardPage({
@@ -218,8 +269,8 @@ async function handleAdminPage(request, env) {
       hasBackup: backup !== null,
       meta,
       validation,
-      subscriptionUrl: `${url.origin}/`,
-      base64Url: `${url.origin}/?b64=1`,
+      subscriptionUrl: subBase,
+      base64Url: `${subBase}?b64=1`,
       hasAuthSecret: hasAuthSecret(env),
     }),
     { nonce }
@@ -249,6 +300,14 @@ async function handleSetup(request, env) {
       }),
       { nonce, status: 400 }
     );
+  }
+
+  // Narrow the first-setup race: KV has no compare-and-swap, so re-check
+  // immediately before committing. Concurrent setups remain theoretically
+  // possible but the window shrinks to a single round-trip.
+  const recheck = await loadPasswordEntry(kv);
+  if (recheck.kind !== "missing") {
+    return jsonResponse({ ok: false, error: "Admin password is already set." }, { status: 409 });
   }
 
   const record = await createPasswordRecord(password, env);
@@ -281,7 +340,7 @@ async function handleLogin(request, env) {
         error: "Too many sign-in attempts. Try again in 15 minutes.",
         warning: authSecretWarning(env),
       }),
-      { nonce, status: 429 }
+      { nonce, status: 429, headers: { "retry-after": String(LOGIN_WINDOW_SECONDS) } }
     );
   }
 
@@ -294,6 +353,20 @@ async function handleLogin(request, env) {
   }
 
   const verification = await verifyPasswordEntry(password, entry, env);
+  if (verification.pepperMismatch) {
+    // The stored hash is bound to a different AUTH_SECRET. Say so plainly
+    // instead of looping on "Invalid credentials" forever.
+    return htmlResponse(
+      generateAuthPage({
+        mode: "login",
+        nonce,
+        error:
+          'AUTH_SECRET changed since this password was saved. Sign-in stays disabled until the stored credential is reset (delete the "admin_password" key in KV, then reload this page).',
+        warning: authSecretWarning(env),
+      }),
+      { nonce, status: 401 }
+    );
+  }
   if (!verification.ok) {
     await recordLoginFailure(kv, clientKey, throttle.count);
     return htmlResponse(
@@ -340,6 +413,16 @@ async function handlePasswordChange(request, env) {
   const session = await requireSessionAndCsrf(request, kv, form);
   if (!session.ok) return session.response;
 
+  // Throttle guesses of the current password (shares the per-IP login budget).
+  const throttleKey = await loginThrottleKey(request);
+  const throttle = await readLoginThrottle(kv, throttleKey);
+  if (throttle.blocked) {
+    return jsonResponse(
+      { ok: false, error: "Too many attempts. Try again in 15 minutes." },
+      { status: 429, headers: { "retry-after": String(LOGIN_WINDOW_SECONDS) } }
+    );
+  }
+
   const currentPassword = getFormString(form, "current_password");
   const newPassword = getFormString(form, "new_password");
   const validationError = validatePassword(newPassword);
@@ -350,28 +433,62 @@ async function handlePasswordChange(request, env) {
   const entry = await loadPasswordEntry(kv);
   const verification = await verifyPasswordEntry(currentPassword, entry, env);
   if (!verification.ok) {
-    return jsonResponse({ ok: false, error: "Current password did not match." }, { status: 401 });
+    if (!verification.pepperMismatch) {
+      await recordLoginFailure(kv, throttleKey, throttle.count);
+    }
+    return jsonResponse(
+      {
+        ok: false,
+        error: verification.pepperMismatch
+          ? "Stored credentials are tied to a different AUTH_SECRET."
+          : "Current password did not match.",
+      },
+      { status: 401 }
+    );
   }
 
   const record = await createPasswordRecord(newPassword, env);
   await kv.put("admin_password", JSON.stringify(record));
-  return jsonResponse({ ok: true, message: "Password updated successfully." });
+  await clearLoginThrottle(kv, throttleKey);
+
+  // Rotating the password invalidates every session, including the current
+  // one — a stolen cookie cannot survive a credential change.
+  await revokeAllSessions(kv);
+
+  return jsonResponse({
+    ok: true,
+    message: "Password updated. All devices were signed out.",
+    signedOut: true,
+  });
 }
 
 async function handleUpdateLinks(request, env) {
   const kv = getKV(env);
   if (!kv) return jsonResponse({ ok: false, error: "KV binding missing." }, { status: 503 });
 
-  const input = await safeRequestInput(request);
-  const session = await requireSessionAndCsrf(request, kv, input);
-  if (!session.ok) return session.response;
+  // Authenticate BEFORE parsing the (potentially large) request body so
+  // unauthenticated callers cannot force multipart/JSON parse work.
+  const session = await getSession(request, kv);
+  if (!session) {
+    return jsonResponse({ ok: false, error: "Authentication required." }, { status: 401 });
+  }
 
+  const input = await safeRequestInput(request);
+  if (!input) {
+    return jsonResponse({ ok: false, error: "Malformed request body." }, { status: 400 });
+  }
   if (!hasInputField(input, "links")) {
     return jsonResponse({ ok: false, error: "Malformed request: missing links field." }, { status: 400 });
   }
 
+  const headerToken = request.headers.get("x-csrf-token") || "";
+  const provided = headerToken || getFormString(input, "csrf_token");
+  if (!provided || !constantTimeEqual(provided, session.data.csrfToken)) {
+    return jsonResponse({ ok: false, error: "CSRF token missing or invalid." }, { status: 403 });
+  }
+
   const links = getFormString(input, "links");
-  const confirmEmpty = getFormString(input, "confirm_empty") === "true";
+  const confirmEmpty = getFormBoolean(input, "confirm_empty");
   const validation = validateSubscriptionContent(links);
 
   if (validation.errors.length) {
@@ -387,11 +504,23 @@ async function handleUpdateLinks(request, env) {
   }
 
   const previousLinks = await kvGet(kv, "vpn_links", "");
+  if (previousLinks === links) {
+    // Byte-identical save: refresh metadata only if missing, skip the rewrites.
+    let meta = await kvGetJson(kv, "vpn_meta", null);
+    if (!meta) {
+      meta = await buildMetadata(links, validation);
+      await kv.put("vpn_meta", JSON.stringify(meta));
+    }
+    return jsonResponse({ ok: true, meta, validation, unchanged: true });
+  }
+
   await kv.put("vpn_links_backup", previousLinks);
-  await kv.put("vpn_links", links);
 
   const meta = await buildMetadata(links, validation);
+  // Commit order matters: metadata first, links last. If any write fails
+  // midway, vpn_links still pairs with a vpn_meta of the matching fingerprint.
   await kv.put("vpn_meta", JSON.stringify(meta));
+  await kv.put("vpn_links", links);
 
   return jsonResponse({ ok: true, meta, validation });
 }
@@ -411,11 +540,12 @@ async function handleRestoreBackup(request, env) {
 
   const current = await kvGet(kv, "vpn_links", "");
   await kv.put("vpn_links_backup", current);
-  await kv.put("vpn_links", backup);
 
   const validation = validateSubscriptionContent(backup);
   const meta = await buildMetadata(backup, validation);
+  // Same commit order as update-links: metadata first, links last.
   await kv.put("vpn_meta", JSON.stringify(meta));
+  await kv.put("vpn_links", backup);
 
   return jsonResponse({ ok: true, links: backup, meta, validation });
 }
@@ -449,8 +579,11 @@ async function generateSubscription(request, env) {
   return textResponse(body, {
     headers: {
       "cache-control": "no-store",
+      // Body depends on User-Agent negotiation, so caches must key on it.
+      vary: "User-Agent",
       "profile-update-interval": "24",
-      "subscription-userinfo": "upload=0; download=0; total=0; expire=0",
+      // No subscription-userinfo header: fabricated zero quotas render as an
+      // "expired"/empty account badge in several clients.
       "content-disposition": `inline; filename="${filename}"`,
       "profile-title": "SubLink Subscription",
     },
@@ -501,6 +634,23 @@ function getFormString(form, key) {
   return typeof value === "string" ? value : "";
 }
 
+function getFormBoolean(form, key) {
+  if (!form) return false;
+  let value;
+  if (typeof form.get === "function") {
+    if (!form.has(key)) return false;
+    value = form.get(key);
+  } else {
+    if (!Object.prototype.hasOwnProperty.call(form, key)) return false;
+    value = form[key];
+  }
+  if (value === true) return true;
+  if (typeof value === "string") {
+    return ["true", "1", "yes", "on"].includes(value.trim().toLowerCase());
+  }
+  return false;
+}
+
 function validatePassword(password) {
   if (!password) return "Password is required.";
   if (password.length < 8) return "Password must be at least 8 characters long.";
@@ -527,6 +677,13 @@ async function loadPasswordEntry(kv) {
   return { kind: "legacy", password: raw };
 }
 
+async function currentPepperId(env) {
+  if (!hasAuthSecret(env)) return "";
+  // Short non-secret identifier of the current pepper, stored WITH the hash so
+  // an AUTH_SECRET rotation is detected instead of surfacing as a bad password.
+  return (await sha256Hex(`pepper-id:${env.AUTH_SECRET}`)).slice(0, 16);
+}
+
 async function createPasswordRecord(password, env) {
   const saltBytes = new Uint8Array(16);
   crypto.getRandomValues(saltBytes);
@@ -540,6 +697,7 @@ async function createPasswordRecord(password, env) {
     iterations: PBKDF2_ITERATIONS,
     salt,
     hash,
+    pepperId: await currentPepperId(env),
     createdAt: new Date().toISOString(),
   };
 }
@@ -555,12 +713,21 @@ async function verifyPasswordEntry(password, entry, env) {
 
   // v3: PBKDF2
   if (record.version === 3 || record.algorithm === "pbkdf2-sha256") {
+    const expectedPepper = await currentPepperId(env);
+    if ((record.pepperId || "") !== expectedPepper) {
+      return { ok: false, migrated: false, pepperMismatch: true };
+    }
     const computed = await hashPasswordPBKDF2(password, record.salt, env, record.iterations || PBKDF2_ITERATIONS);
     return { ok: constantTimeEqual(computed, record.hash), migrated: true };
   }
 
   // v2: Legacy salted SHA-256 or HMAC
   if (record.version === 2) {
+    if (record.algorithm === "hmac-sha256" && !hasAuthSecret(env)) {
+      // HMAC records are permanently unusable without their pepper; report it
+      // clearly instead of failing as "invalid credentials" with no way to migrate.
+      return { ok: false, migrated: false, pepperMismatch: true };
+    }
     const computed = await hashPasswordV2Legacy(password, record.salt, env, record.algorithm);
     return { ok: constantTimeEqual(computed, record.hash), migrated: false };
   }
@@ -682,24 +849,48 @@ function expireSessionCookie() {
 }
 
 async function loginThrottleKey(request) {
-  // Use Cloudflare connecting IP directly; do NOT blindly trust X-Forwarded-For to prevent IP spoofing
+  // Key on the edge-reported client IP only. Deliberately excludes User-Agent:
+  // rotating UAs must never reset the failure counter. CF-Connecting-IP is set
+  // by Cloudflare and cannot be spoofed by clients through the edge.
   const ip = request.headers.get("CF-Connecting-IP") || "direct-ip";
-  const userAgent = request.headers.get("User-Agent") || "generic";
-  return `login_fail:${await sha256Hex(`${ip}|${userAgent}`)}`;
+  return `login_fail:${await sha256Hex(ip)}`;
 }
 
+// Fixed-window failure tracker. NOTE: KV is eventually consistent, so parallel
+// attempts can under-count; treat this as best-effort damping. Hard guarantees
+// would require Durable Objects.
 async function readLoginThrottle(kv, key) {
-  const data = await kvGetJson(kv, key, { count: 0 });
+  const data = await kvGetJson(kv, key, null);
+  if (!data) return { count: 0, blocked: false };
+
+  const now = Date.now();
+  const startedAt = Date.parse(data.windowStart || "") || now;
+  if (now - startedAt >= LOGIN_WINDOW_SECONDS * 1000) {
+    return { count: 0, blocked: false };
+  }
   const count = Number(data.count || 0);
   return { count, blocked: count >= LOGIN_MAX_FAILURES };
 }
 
-async function recordLoginFailure(kv, key, currentCount) {
+async function recordLoginFailure(kv, key, _currentCount) {
+  const existing = await kvGetJson(kv, key, null);
+  const now = Date.now();
+
+  let count = 1;
+  let windowStart = now;
+  if (existing) {
+    const priorStart = Date.parse(existing.windowStart || "") || now;
+    if (now - priorStart < LOGIN_WINDOW_SECONDS * 1000) {
+      windowStart = priorStart;
+      count = Number(existing.count || 0) + 1;
+    }
+  }
+
   await kv.put(
     key,
     JSON.stringify({
-      count: currentCount + 1,
-      updatedAt: new Date().toISOString(),
+      count,
+      windowStart: new Date(windowStart).toISOString(),
     }),
     { expirationTtl: LOGIN_WINDOW_SECONDS }
   );
@@ -707,6 +898,25 @@ async function recordLoginFailure(kv, key, currentCount) {
 
 async function clearLoginThrottle(kv, key) {
   await kv.delete(key);
+}
+
+async function revokeAllSessions(kv) {
+  // Best-effort sweep of every active session (used after a password change).
+  try {
+    let cursor;
+    do {
+      const options = { prefix: "session:" };
+      if (cursor) options.cursor = cursor;
+      const page = await kv.list(options);
+      for (const key of page.keys || []) {
+        await kv.delete(key.name);
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+  } catch (_error) {
+    // Non-standard KV bindings may not support list(); sessions then simply
+    // age out at their normal TTL.
+  }
 }
 
 function parseCookies(header) {
@@ -719,6 +929,14 @@ function parseCookies(header) {
     cookies.set(trimmed.slice(0, index), trimmed.slice(index + 1));
   }
   return cookies;
+}
+
+function decodeURIComponentSafe(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch (_error) {
+    return "";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -747,7 +965,12 @@ async function buildMetadata(content, validation = validateSubscriptionContent(c
     fingerprint: await sha256Hex(content),
     configCount: validation.configCount,
     protocolCounts: validation.protocolCounts,
+    isEmpty: validation.isEmpty,
     warningCount: validation.warnings.length,
+    // Persisted so the dashboard can reconstruct diagnostics from the cache
+    // without re-running the parser on every load.
+    warnings: validation.warnings.slice(0, 50),
+    errors: validation.errors.slice(0, 10),
   };
 }
 
@@ -779,9 +1002,14 @@ function validateSubscriptionContent(content) {
 
   const seen = new Set();
   let index = 0;
+  let lineNumber = 1;
 
+  // Line numbers are tracked incrementally: recomputing them per line made
+  // validation quadratic on large payloads.
   while (index < text.length) {
-    index = skipWhitespace(text, index);
+    const trimmedIndex = skipWhitespace(text, index);
+    lineNumber += countNewlinesBetween(text, index, trimmedIndex);
+    index = trimmedIndex;
     if (index >= text.length) break;
 
     const char = text[index];
@@ -790,19 +1018,23 @@ function validateSubscriptionContent(content) {
       if (block.complete) {
         const rawBlock = text.slice(index, block.end);
         recordDuplicate(rawBlock.trim(), seen, result);
-        recordJsonBlock(rawBlock, lineNumberAt(text, index), result);
+        recordJsonBlock(rawBlock, lineNumber, result);
+        lineNumber += countNewlinesBetween(text, index, block.end);
         index = block.end;
         continue;
       }
 
-      pushWarning(result, `Unclosed JSON block near line ${lineNumberAt(text, index)}.`);
-      index = nextLineIndex(text, index);
+      pushWarning(result, `Unclosed JSON block near line ${lineNumber}.`);
+      const blockLineEnd = Math.min(nextLineIndex(text, index) + 1, text.length);
+      lineNumber += countNewlinesBetween(text, index, blockLineEnd);
+      index = blockLineEnd;
       continue;
     }
 
     const lineEnd = nextLineIndex(text, index);
     const line = text.slice(index, lineEnd).trim();
-    recordLine(line, lineNumberAt(text, index), seen, result);
+    recordLine(line, lineNumber, seen, result);
+    lineNumber += countNewlinesBetween(text, index, Math.min(lineEnd + 1, text.length));
     index = lineEnd + 1;
   }
 
@@ -908,9 +1140,10 @@ function nextLineIndex(text, index) {
   return lineFeed === -1 ? text.length : lineFeed;
 }
 
-function lineNumberAt(text, index) {
-  let count = 1;
-  for (let i = 0; i < index; i += 1) {
+function countNewlinesBetween(text, from, to) {
+  const end = Math.min(to, text.length);
+  let count = 0;
+  for (let i = Math.max(from, 0); i < end; i += 1) {
     if (text[i] === "\n") count += 1;
   }
   return count;
@@ -1099,7 +1332,7 @@ function generateDashboardPage({
           </div>
           <div class="stat-box">
             <span class="stat-label">Issues</span>
-            <span id="stat-issues" class="stat-val mono-stat">${validation.warnings.length}</span>
+            <span id="stat-issues" class="stat-val mono-stat">${validation.warnings.length + validation.errors.length}</span>
           </div>
           <div class="stat-box">
             <span class="stat-label">Last Saved</span>
@@ -1698,6 +1931,9 @@ function dashboardScript() {
 (function () {
   "use strict";
 
+  const SUPPORTED_PROTOCOLS = ${JSON.stringify(SUPPORTED_PROTOCOLS)};
+  const MAX_EDITOR_BYTES = ${MAX_LINKS_BYTES};
+
   const state = JSON.parse(document.getElementById("sublink-data").textContent);
   const csrfToken = state.csrfToken;
   const editor = document.getElementById("links-editor");
@@ -1721,6 +1957,16 @@ function dashboardScript() {
     return (bytes / 1024 / 1024).toFixed(2) + " MiB";
   }
 
+  async function readJson(res) {
+    try {
+      return await res.json();
+    } catch (_error) {
+      let detail = "";
+      try { detail = (await res.text()).slice(0, 160); } catch (_ignored) {}
+      return { ok: false, error: detail || ("HTTP " + res.status) };
+    }
+  }
+
   function toast(msg, isError) {
     const shelf = document.getElementById("toast-shelf");
     const item = document.createElement("div");
@@ -1741,29 +1987,39 @@ function dashboardScript() {
   function renderStats(val, meta) {
     document.getElementById("stat-nodes").textContent = val.configCount;
     document.getElementById("stat-size").textContent = formatBytes(val.byteSize);
-    document.getElementById("stat-issues").textContent = val.warnings.length + (val.errors || []).length;
+    document.getElementById("stat-issues").textContent =
+      (val.warnings || []).length + (val.errors || []).length;
     if (meta && meta.updatedAt) {
       const dt = new Date(meta.updatedAt);
-      document.getElementById("stat-saved").textContent = dt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' });
+      if (!Number.isNaN(dt.getTime())) {
+        // Same formatter as the server-side formatDate so SSR and live values agree.
+        document.getElementById("stat-saved").textContent = dt.toLocaleString("en-US", { hour12: false });
+      }
     }
     charCounter.textContent = countLines(editor.value) + " lines";
 
-    // Protocol list
     const protoContainer = document.getElementById("protocol-container");
     protoContainer.innerHTML = "";
     const entries = Object.entries(val.protocolCounts || {});
     if (!entries.length) {
-      protoContainer.innerHTML = '<span style="font-size:12px;color:var(--text-dim)">No active protocols</span>';
+      const empty = document.createElement("span");
+      empty.style.fontSize = "12px";
+      empty.style.color = "var(--text-dim)";
+      empty.textContent = "No active protocols";
+      protoContainer.appendChild(empty);
     } else {
-      entries.sort().forEach(function (e) {
-        const span = document.createElement("span");
-        span.className = "proto-tag";
-        span.innerHTML = e[0] + ": <strong>" + e[1] + "</strong>";
-        protoContainer.appendChild(span);
+      entries.sort(function (a, b) { return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0; });
+      entries.forEach(function (entry) {
+        const pill = document.createElement("span");
+        pill.className = "proto-tag";
+        pill.appendChild(document.createTextNode(entry[0] + ": "));
+        const strong = document.createElement("strong");
+        strong.textContent = String(entry[1]);
+        pill.appendChild(strong);
+        protoContainer.appendChild(pill);
       });
     }
 
-    // Diagnostics
     const diagContainer = document.getElementById("diagnostics-container");
     diagContainer.innerHTML = "";
     const issues = []
@@ -1771,56 +2027,150 @@ function dashboardScript() {
       .concat((val.warnings || []).map(function (m) { return { type: "warning", msg: m }; }));
 
     if (!issues.length) {
-      diagContainer.innerHTML = '<div class="diag-item">Configs well-formed. No syntax issues.</div>';
+      const okItem = document.createElement("div");
+      okItem.className = "diag-item";
+      okItem.textContent = "Configs well-formed. No syntax issues.";
+      diagContainer.appendChild(okItem);
     } else {
-      issues.forEach(function (i) {
+      issues.forEach(function (issue) {
         const item = document.createElement("div");
-        item.className = "diag-item " + i.type;
-        item.textContent = i.msg;
+        item.className = "diag-item " + issue.type;
+        item.textContent = issue.msg;
         diagContainer.appendChild(item);
       });
     }
   }
 
-  function analyzeClientSide(text) {
-    const lines = text.split(/\\r?\\n/);
-    const supported = ${JSON.stringify(SUPPORTED_PROTOCOLS)};
-    const protocolCounts = {};
-    const warnings = [];
-    let configCount = 0;
-    const seen = new Set();
+  function findJsonBlockEnd(text, start) {
+    const stack = [text.charAt(start)];
+    let inString = false;
+    let escaped = false;
+    for (let i = start + 1; i < text.length; i += 1) {
+      const ch = text.charAt(i);
+      if (inString) {
+        if (escaped) { escaped = false; }
+        else if (ch === "\\\\") { escaped = true; }
+        else if (ch === '"') { inString = false; }
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === "{" || ch === "[") { stack.push(ch); continue; }
+      if (ch === "}" || ch === "]") {
+        const opener = stack.pop();
+        if ((ch === "}" && opener !== "{") || (ch === "]" && opener !== "[")) return -1;
+        if (!stack.length) return i + 1;
+      }
+    }
+    return -1;
+  }
 
+  // Mirrors the server-side validator so live stats match saved stats:
+  // same JSON-block expansion, duplicate messages, and warning cap.
+  function analyzeClientSide(text) {
     if (!text.trim()) {
-      return { byteSize: 0, isEmpty: true, configCount: 0, protocolCounts: {}, warnings: ["Editor empty."] };
+      return {
+        byteSize: 0,
+        isEmpty: true,
+        configCount: 0,
+        protocolCounts: {},
+        warnings: ["Subscription is currently empty."],
+        errors: []
+      };
     }
 
-    lines.forEach(function (l, idx) {
-      const line = l.trim();
-      if (!line) return;
-      if (seen.has(line)) warnings.push("Duplicate on line " + (idx + 1));
-      seen.add(line);
-      const match = /^([a-z][a-z0-9+.-]*):\\/\\//i.exec(line);
-      if (match) {
-        const p = match[1].toLowerCase();
-        if (supported.includes(p)) {
-          configCount += 1;
-          protocolCounts[p] = (protocolCounts[p] || 0) + 1;
-        } else {
-          warnings.push("Unsupported protocol: " + p);
-        }
-      } else if (line.startsWith("{") || line.startsWith("[")) {
-        configCount += 1;
-        protocolCounts.json = (protocolCounts.json || 0) + 1;
+    const byteSize = new TextEncoder().encode(text).length;
+    const errors = [];
+    if (byteSize > MAX_EDITOR_BYTES) {
+      errors.push("Content size (" + formatBytes(byteSize) + ") exceeds the 24 MiB limit.");
+    }
+
+    const protocolCounts = {};
+    const warnings = [];
+    const seen = new Set();
+    let configCount = 0;
+
+    function pushWarning(message) {
+      if (warnings.length < 50) warnings.push(message);
+    }
+    function recordDuplicate(value) {
+      if (!value) return;
+      if (seen.has(value)) pushWarning("Duplicate entry detected: " + value.slice(0, 40) + "...");
+      else seen.add(value);
+    }
+    function bump(protocol, amount) {
+      configCount += amount;
+      protocolCounts[protocol] = (protocolCounts[protocol] || 0) + amount;
+    }
+
+    let index = 0;
+    let lineNumber = 1;
+
+    while (index < text.length) {
+      while (index < text.length && /\\s/.test(text.charAt(index))) {
+        if (text.charAt(index) === "\\n") lineNumber += 1;
+        index += 1;
       }
-    });
+      if (index >= text.length) break;
+
+      const ch = text.charAt(index);
+      if (ch === "{" || ch === "[") {
+        const end = findJsonBlockEnd(text, index);
+        if (end !== -1) {
+          const raw = text.slice(index, end);
+          recordDuplicate(raw.trim());
+          try {
+            const parsed = JSON.parse(raw);
+            const amount = Array.isArray(parsed) ? parsed.length : 1;
+            if (Array.isArray(parsed) && amount === 0) {
+              pushWarning("JSON array on line " + lineNumber + " is empty.");
+            }
+            bump("json", Math.max(amount, 0));
+          } catch (_error) {
+            pushWarning("Invalid JSON block near line " + lineNumber + ".");
+          }
+          for (let k = index; k < end; k += 1) {
+            if (text.charAt(k) === "\\n") lineNumber += 1;
+          }
+          index = end;
+          continue;
+        }
+        pushWarning("Unclosed JSON block near line " + lineNumber + ".");
+        let nl = text.indexOf("\\n", index);
+        if (nl === -1) nl = text.length;
+        for (let k = index; k <= nl && k < text.length; k += 1) {
+          if (text.charAt(k) === "\\n") lineNumber += 1;
+        }
+        index = nl + 1;
+        continue;
+      }
+
+      let nl = text.indexOf("\\n", index);
+      if (nl === -1) nl = text.length;
+      const line = text.slice(index, nl).trim();
+      if (line) {
+        const match = /^([a-z][a-z0-9+.-]*):\\/\\//i.exec(line);
+        if (match && SUPPORTED_PROTOCOLS.indexOf(match[1].toLowerCase()) !== -1) {
+          bump(match[1].toLowerCase(), 1);
+          recordDuplicate(line);
+        } else if (match) {
+          pushWarning("Unsupported protocol on line " + lineNumber + ": " + line.slice(0, 40));
+        } else {
+          pushWarning("Unknown format on line " + lineNumber + ": " + line.slice(0, 40));
+        }
+      }
+      for (let k = index; k <= nl && k < text.length; k += 1) {
+        if (text.charAt(k) === "\\n") lineNumber += 1;
+      }
+      index = nl + 1;
+    }
 
     return {
-      byteSize: new TextEncoder().encode(text).length,
+      byteSize: byteSize,
       isEmpty: false,
       configCount: configCount,
       protocolCounts: protocolCounts,
-      warnings: warnings.slice(0, 30),
-      errors: []
+      warnings: warnings,
+      errors: errors
     };
   }
 
@@ -1852,17 +2202,17 @@ function dashboardScript() {
         },
         body: JSON.stringify({
           links: text,
-          confirm_empty: val.isEmpty ? "true" : "false",
+          confirm_empty: val.isEmpty,
         }),
       });
-      const data = await res.json();
+      const data = await readJson(res);
       if (!res.ok || !data.ok) throw new Error(data.error || "Save failed");
 
       lastCleanValue = text;
       renderStats(data.validation, data.meta);
       setStatus("saved", "Synced");
       restoreBtn.disabled = false;
-      toast("Subscription updated successfully.");
+      toast(data.unchanged ? "Already up to date." : "Subscription updated successfully.");
     } catch (err) {
       setStatus("error", "Error");
       toast(err.message, true);
@@ -1884,13 +2234,20 @@ function dashboardScript() {
 
   fileInput.addEventListener("change", function () {
     const f = fileInput.files[0];
+    fileInput.value = "";
     if (!f) return;
+    if (f.size > MAX_EDITOR_BYTES) {
+      toast("File exceeds the " + formatBytes(MAX_EDITOR_BYTES) + " limit.", true);
+      return;
+    }
+    if (editor.value !== lastCleanValue && !confirm("You have unsaved changes. Discard them and import this file?")) {
+      return;
+    }
     const r = new FileReader();
     r.onload = function () {
       editor.value = String(r.result || "");
       editor.dispatchEvent(new Event("input"));
       toast("Imported " + f.name);
-      fileInput.value = "";
     };
     r.readAsText(f);
   });
@@ -1915,7 +2272,7 @@ function dashboardScript() {
         headers: { "x-csrf-token": csrfToken },
         body: fd,
       });
-      const data = await res.json();
+      const data = await readJson(res);
       if (!res.ok || !data.ok) throw new Error(data.error || "Rollback failed");
       editor.value = data.links;
       lastCleanValue = data.links;
@@ -1962,10 +2319,13 @@ function dashboardScript() {
         headers: { "x-csrf-token": csrfToken },
         body: fd,
       });
-      const data = await res.json();
+      const data = await readJson(res);
       if (!res.ok || !data.ok) throw new Error(data.error || "Failed to update password");
       e.currentTarget.reset();
-      toast("Password updated.");
+      toast(data.message || "Password updated.");
+      if (data.signedOut) {
+        setTimeout(function () { window.location.href = "/admin"; }, 1200);
+      }
     } catch (err) {
       toast(err.message, true);
     }
@@ -2155,5 +2515,7 @@ export const __SUBLINK_WORKER_TESTS__ = {
   loadPasswordEntry,
   constantTimeEqual,
   escapeHtml,
+  sha256Hex,
+  normalizePath,
   SESSION_COOKIE,
 };
